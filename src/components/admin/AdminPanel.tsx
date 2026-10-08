@@ -70,6 +70,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const navContainerRef = useRef<HTMLDivElement>(null);
   const [canScrollLeft, setCanScrollLeft] = useState(false);
   const [canScrollRight, setCanScrollRight] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [startX, setStartX] = useState(0);
+  const [scrollLeftState, setScrollLeftState] = useState(0);
 
   // Check WebAuthn platform support
   useEffect(() => {
@@ -94,10 +97,45 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
   const slideNav = (direction: 'left' | 'right') => {
     if (navContainerRef.current) {
-      const offset = direction === 'left' ? -200 : 200;
+      const offset = direction === 'left' ? -220 : 220;
       navContainerRef.current.scrollBy({ left: offset, behavior: 'smooth' });
       setTimeout(checkScrollBounds, 300);
     }
+  };
+
+  const handleTabClick = (tabId: AdminTab, element: HTMLElement) => {
+    setActiveTab(tabId);
+    if (navContainerRef.current) {
+      const container = navContainerRef.current;
+      const elLeft = element.offsetLeft;
+      const elWidth = element.offsetWidth;
+      const containerWidth = container.offsetWidth;
+      const targetScroll = elLeft - (containerWidth / 2) + (elWidth / 2);
+      container.scrollTo({
+        left: targetScroll,
+        behavior: 'smooth',
+      });
+    }
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (!navContainerRef.current) return;
+    setIsDragging(true);
+    setStartX(e.pageX - navContainerRef.current.offsetLeft);
+    setScrollLeftState(navContainerRef.current.scrollLeft);
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDragging || !navContainerRef.current) return;
+    e.preventDefault();
+    const x = e.pageX - navContainerRef.current.offsetLeft;
+    const walk = (x - startX) * 1.5;
+    navContainerRef.current.scrollLeft = scrollLeftState - walk;
+    checkScrollBounds();
+  };
+
+  const handleMouseUpOrLeave = () => {
+    setIsDragging(false);
   };
 
   // Fetch data
@@ -260,100 +298,57 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     }
   };
 
-  const navTabs: { id: AdminTab; label: string; icon: React.ReactNode }[] = [
+  const navTabs: { id: AdminTab; label: string; icon: React.ReactNode; count?: number }[] = [
     { id: 'dashboard', label: 'Dashboard', icon: <Activity className="w-3.5 h-3.5" /> },
-    { id: 'enquiries', label: `Anfragen (${enquiries.length})`, icon: <MessageSquare className="w-3.5 h-3.5" /> },
-    { id: 'products', label: 'Reagenzien & Bestand', icon: <Package className="w-3.5 h-3.5" /> },
+    { id: 'enquiries', label: 'Anfragen', icon: <MessageSquare className="w-3.5 h-3.5" />, count: enquiries.length },
+    { id: 'products', label: 'Reagenzien & Bestand', icon: <Package className="w-3.5 h-3.5" />, count: CHEMICAL_PRODUCTS.length },
     { id: 'keys', label: 'Keys & Storage', icon: <Key className="w-3.5 h-3.5" /> },
     { id: 'profile', label: 'Admin-Profil', icon: <User className="w-3.5 h-3.5" /> },
-    { id: 'security', label: `Sicherheit & Passkeys (${passkeys.length})`, icon: <Fingerprint className="w-3.5 h-3.5" /> },
+    { id: 'security', label: 'Sicherheit & Passkeys', icon: <Fingerprint className="w-3.5 h-3.5" />, count: passkeys.length },
   ];
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans">
       
-      {/* Top Admin Header with Horizontal Smooth Slidable Menu (NO 3-lines menu!) */}
-      <header className="sticky top-0 z-40 bg-slate-950/95 backdrop-blur-md border-b border-slate-800">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-3">
+      {/* Top Admin Header with Dedicated Slidable Menu Row at Bottom of Top Navbar */}
+      <header className="sticky top-0 z-40 bg-slate-950/95 backdrop-blur-md border-b border-slate-800 shadow-md">
+        
+        {/* Tier 1 (Top Bar): Website Logo, Brand Identity, and Header Actions */}
+        <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 h-15 flex items-center justify-between gap-3">
           
-          {/* Left: Aniixa Admin Wordmark */}
+          {/* Left: Aniixa Admin Logo & Wordmark */}
           <div className="flex items-center gap-2.5 shrink-0 select-none">
-            <div className="w-8 h-8 rounded-lg bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 font-bold flex items-center justify-center font-mono text-sm shadow-inner">
-              <Shield className="w-4 h-4" />
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-500/25 to-emerald-700/20 border border-emerald-500/40 text-emerald-400 font-bold flex items-center justify-center font-mono shadow-xs">
+              <Shield className="w-4.5 h-4.5" />
             </div>
             <div>
-              <div className="text-sm font-bold tracking-tight text-white flex items-center gap-1.5">
+              <div className="text-sm sm:text-base font-bold tracking-tight text-white flex items-center gap-1.5 sm:gap-2">
                 <span>Aniixa</span>
-                <span className="text-[10px] uppercase font-mono px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/80">
+                <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-400 border border-emerald-700/60 font-semibold tracking-wider">
                   Admin
                 </span>
               </div>
-              <div className="text-[10px] text-slate-400 font-mono truncate max-w-[140px] sm:max-w-none">
-                {adminUser?.email || 'lunexa.official@gmail.com'}
+              <div className="text-[11px] text-slate-400 font-mono flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="truncate max-w-[150px] sm:max-w-none">
+                  {adminUser?.email || 'lunexa.official@gmail.com'}
+                </span>
               </div>
             </div>
           </div>
 
-          {/* Center: Horizontal Smooth Slidable Menu */}
-          <div className="relative flex-1 min-w-0 flex items-center px-1 sm:px-3">
-            {canScrollLeft && (
-              <button
-                onClick={() => slideNav('left')}
-                className="absolute left-0 z-20 w-6 h-6 rounded-full bg-slate-800 border border-slate-700 text-slate-300 hover:text-white flex items-center justify-center cursor-pointer shadow-xs"
-                aria-label="Nach links"
-              >
-                <ChevronLeft className="w-3.5 h-3.5" />
-              </button>
+          {/* Right: Quick Action Controls */}
+          <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
+            {stats?.databaseConnected && (
+              <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/40 border border-emerald-800/60 text-emerald-400 text-xs font-mono">
+                <Database className="w-3.5 h-3.5" />
+                <span>Neon DB Aktiv</span>
+              </div>
             )}
 
-            <div
-              ref={navContainerRef}
-              onScroll={checkScrollBounds}
-              className="flex items-center gap-1.5 overflow-x-auto scroll-smooth py-1 px-1 w-full scrollbar-none"
-              style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
-            >
-              {navTabs.map((tab) => {
-                const isSelected = activeTab === tab.id;
-                return (
-                  <button
-                    key={tab.id}
-                    onClick={() => setActiveTab(tab.id)}
-                    className={`relative px-3.5 py-1.5 text-xs font-semibold rounded-full whitespace-nowrap transition-colors flex items-center gap-1.5 cursor-pointer shrink-0 ${
-                      isSelected
-                        ? 'text-white'
-                        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-                    }`}
-                  >
-                    {isSelected && (
-                      <motion.div
-                        layoutId="adminNavPill"
-                        className="absolute inset-0 bg-emerald-600 rounded-full shadow-xs -z-1"
-                        transition={{ type: 'spring', stiffness: 500, damping: 35 }}
-                      />
-                    )}
-                    {tab.icon}
-                    <span>{tab.label}</span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {canScrollRight && (
-              <button
-                onClick={() => slideNav('right')}
-                className="absolute right-0 z-20 w-6 h-6 rounded-full bg-slate-800 border border-slate-700 text-slate-300 hover:text-white flex items-center justify-center cursor-pointer shadow-xs"
-                aria-label="Nach rechts"
-              >
-                <ChevronRight className="w-3.5 h-3.5" />
-              </button>
-            )}
-          </div>
-
-          {/* Right: Quick Actions */}
-          <div className="flex items-center gap-2 shrink-0">
             <button
               onClick={onReturnToMarket}
-              className="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors hidden sm:inline-flex items-center gap-1.5 cursor-pointer"
+              className="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer shadow-xs"
             >
               <span>Zum Markt</span>
               <ExternalLink className="w-3.5 h-3.5 text-slate-400" />
@@ -361,15 +356,94 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
             <button
               onClick={onLogout}
-              className="p-2 sm:px-3 sm:py-1.5 text-xs font-medium bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-900/50 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+              className="px-3 py-1.5 text-xs font-medium bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-900/60 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
               title="Abmelden"
             >
               <LogOut className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">Abmelden</span>
             </button>
           </div>
-
         </div>
+
+        {/* Tier 2 (Bottom of Top Navbar / Logo): Full-Width Smooth Slidable Horizontal Menu */}
+        <div className="border-t border-slate-800/80 bg-slate-950/60">
+          <div className="max-w-7xl mx-auto px-2 sm:px-6 lg:px-8 relative flex items-center py-2">
+            
+            {/* Subtle Left Slide Chevron */}
+            {canScrollLeft && (
+              <button
+                onClick={() => slideNav('left')}
+                className="absolute left-1 sm:left-3 z-20 w-7 h-7 rounded-full bg-slate-800/95 border border-slate-700 text-slate-200 hover:text-white hover:bg-slate-700 flex items-center justify-center cursor-pointer shadow-md transition-all"
+                aria-label="Nach links schieben"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+            )}
+
+            {/* Horizontal Smooth Slidable Menu Track with Drag & Snap */}
+            <div
+              ref={navContainerRef}
+              onScroll={checkScrollBounds}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUpOrLeave}
+              onMouseLeave={handleMouseUpOrLeave}
+              className={`flex items-center gap-2 overflow-x-auto scroll-smooth px-1 sm:px-2 w-full select-none ${
+                isDragging ? 'cursor-grabbing' : 'cursor-grab'
+              }`}
+              style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
+            >
+              {navTabs.map((tab) => {
+                const isSelected = activeTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    onClick={(e) => handleTabClick(tab.id, e.currentTarget)}
+                    className={`relative px-3.5 sm:px-4 py-2 text-xs font-semibold rounded-lg whitespace-nowrap transition-colors flex items-center gap-2 cursor-pointer shrink-0 ${
+                      isSelected
+                        ? 'text-white shadow-xs'
+                        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+                    }`}
+                  >
+                    {isSelected && (
+                      <motion.div
+                        layoutId="adminNavPill"
+                        className="absolute inset-0 bg-emerald-600 rounded-lg shadow-sm -z-1"
+                        transition={{ type: 'spring', stiffness: 450, damping: 35 }}
+                      />
+                    )}
+                    <span className={isSelected ? 'text-white' : 'text-slate-400'}>{tab.icon}</span>
+                    <span>{tab.label}</span>
+                    {tab.count !== undefined && (
+                      <span
+                        className={`text-[10px] font-mono px-1.5 py-0.2 rounded-full font-bold ${
+                          isSelected
+                            ? 'bg-emerald-950/70 text-emerald-200 border border-emerald-400/30'
+                            : 'bg-slate-800 text-slate-400 border border-slate-700/60'
+                        }`}
+                      >
+                        {tab.count}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Subtle Right Slide Chevron */}
+            {canScrollRight && (
+              <button
+                onClick={() => slideNav('right')}
+                className="absolute right-1 sm:right-3 z-20 w-7 h-7 rounded-full bg-slate-800/95 border border-slate-700 text-slate-200 hover:text-white hover:bg-slate-700 flex items-center justify-center cursor-pointer shadow-md transition-all"
+                aria-label="Nach rechts schieben"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            )}
+
+          </div>
+        </div>
+
       </header>
 
       {/* Main Admin Content Stage */}
