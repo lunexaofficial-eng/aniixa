@@ -1,0 +1,9 @@
+{
+  "name": "ChemikalDirekt Deutschland",
+  "description": "High-purity German chemical & reagent marketplace. Direct purchasing without B2B barriers, transparent specifications, and instant WhatsApp inquiry dispatch.",
+  "requestFramePermissions": [
+    "publickey-credentials-create",
+    "publickey-credentials-get"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
