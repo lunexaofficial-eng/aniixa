@@ -125,109 +125,222 @@ export const memoryIntegrationKeys: Record<string, any> = {
   ],
 };
 
-let dbInitPromise: Promise<void> | null = null;
+function getEffectiveDatabaseUrl(rawUrl?: string): string | undefined {
+  if (!rawUrl) return undefined;
+  let url = rawUrl.trim();
+  // Fix Node pg-connection-string security warning:
+  // "The SSL modes 'prefer', 'require', and 'verify-ca' are treated as aliases for 'verify-full'..."
+  // "If you want libpq compatibility now, use 'uselibpqcompat=true&sslmode=require'"
+  if (url.includes('sslmode=require') && !url.includes('uselibpqcompat=')) {
+    url = url.replace('sslmode=require', 'uselibpqcompat=true&sslmode=require');
+  }
+  return url;
+}
 
-export async function initDatabase(): Promise<void> {
-  if (dbInitPromise) return dbInitPromise;
+function createNeonPool(connectionString: string): Pool {
+  const p = new Pool({
+    connectionString,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 20000, // 20s: accommodates Neon cold-start compute spinup
+    idleTimeoutMillis: 30000,       // Close idle connections after 30s
+    max: 10,                        // Prevent connection exhaustion in serverless
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10000,
+  });
+
+  p.on('error', (err: any) => {
+    console.warn('⚠️ Neon PostgreSQL Pool Socket-Event:', err.message);
+  });
+
+  return p;
+}
+
+let dbInitPromise: Promise<void> | null = null;
+let lastInitAttempt = 0;
+
+export async function initDatabase(forceRetry = false): Promise<void> {
+  const rawUrl = process.env.DATABASE_URL;
+  if (!rawUrl) {
+    return;
+  }
+
+  if (isDbConnected && pool && !forceRetry) {
+    return;
+  }
+
+  if (dbInitPromise && !forceRetry) {
+    return dbInitPromise;
+  }
+
+  const now = Date.now();
+  if (!forceRetry && dbError && now - lastInitAttempt < 2000) {
+    return;
+  }
+  lastInitAttempt = now;
 
   dbInitPromise = (async () => {
-    if (!databaseUrl) {
-      console.log('ℹ️ DATABASE_URL nicht angegeben. Nutze In-Memory-Speicher.');
-      return;
-    }
+    const effectiveUrl = getEffectiveDatabaseUrl(rawUrl);
+    if (!effectiveUrl) return;
 
-    try {
-      if (!pool) {
-        pool = new Pool({
-          connectionString: databaseUrl,
-          ssl: { rejectUnauthorized: false },
-          connectionTimeoutMillis: 5000,
-        });
-      }
+    let lastError: any = null;
+    const maxAttempts = 3;
 
-      // 1. enquiries table
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS enquiries (
-          id SERIAL PRIMARY KEY,
-          product_id VARCHAR(100) NOT NULL,
-          product_name VARCHAR(255) NOT NULL,
-          product_price VARCHAR(100) NOT NULL,
-          product_thumbnail TEXT,
-          buyer_name VARCHAR(255) NOT NULL,
-          buyer_email VARCHAR(255) NOT NULL,
-          buyer_phone VARCHAR(100) NOT NULL,
-          notes TEXT,
-          status VARCHAR(50) DEFAULT 'NEW',
-          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-          whatsapp_sent BOOLEAN DEFAULT TRUE
-        );
-      `);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        if (!pool) {
+          pool = createNeonPool(effectiveUrl);
+        }
 
-      // 2. admin_users table
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS admin_users (
-          id SERIAL PRIMARY KEY,
-          email VARCHAR(255) UNIQUE NOT NULL,
-          password_hash VARCHAR(255) NOT NULL,
-          salt VARCHAR(255) NOT NULL,
-          full_name VARCHAR(255) NOT NULL,
-          phone VARCHAR(100),
-          role VARCHAR(50) DEFAULT 'SUPER_ADMIN',
-          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-          last_login TIMESTAMP WITH TIME ZONE
-        );
-      `);
+        // 1. Test ping to wake up Neon compute
+        await pool.query('SELECT 1 as ping');
 
-      // 3. admin_passkeys table
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS admin_passkeys (
-          id SERIAL PRIMARY KEY,
-          user_id INTEGER REFERENCES admin_users(id) ON DELETE CASCADE,
-          credential_id TEXT UNIQUE NOT NULL,
-          public_key TEXT NOT NULL,
-          counter INTEGER DEFAULT 0,
-          device_name VARCHAR(255) DEFAULT 'Biometrischer Fingerabdruck / Passkey',
-          transports TEXT,
-          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-          last_used TIMESTAMP WITH TIME ZONE
-        );
-      `);
-
-      // 4. admin_integration_keys table
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS admin_integration_keys (
-          id SERIAL PRIMARY KEY,
-          service_name VARCHAR(100) UNIQUE NOT NULL,
-          credentials TEXT NOT NULL,
-          is_active BOOLEAN DEFAULT TRUE,
-          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-        );
-      `);
-
-      // 5. Seed default admin account
-      const checkUser = await pool.query('SELECT * FROM admin_users WHERE email = $1', ['lunexa.official@gmail.com']);
-      if (checkUser.rows.length === 0) {
+        // 2. enquiries table
         await pool.query(`
-          INSERT INTO admin_users (email, password_hash, salt, full_name, phone, role)
-          VALUES ($1, $2, $3, $4, $5, $6)
-        `, ['lunexa.official@gmail.com', DEFAULT_HASH, DEFAULT_SALT, 'Aniixa Hauptadministrator', '+49 1520 1234567', 'SUPER_ADMIN']);
-      } else {
-        const existing = checkUser.rows[0];
-        const testHash = hashPassword('Md1620@gmail', existing.salt);
-        if (testHash !== existing.password_hash) {
-          await pool.query('UPDATE admin_users SET password_hash = $1 WHERE id = $2', [testHash, existing.id]);
+          CREATE TABLE IF NOT EXISTS enquiries (
+            id SERIAL PRIMARY KEY,
+            product_id VARCHAR(100) NOT NULL,
+            product_name VARCHAR(255) NOT NULL,
+            product_price VARCHAR(100) NOT NULL,
+            product_thumbnail TEXT,
+            buyer_name VARCHAR(255) NOT NULL,
+            buyer_email VARCHAR(255) NOT NULL,
+            buyer_phone VARCHAR(100) NOT NULL,
+            notes TEXT,
+            status VARCHAR(50) DEFAULT 'NEW',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            whatsapp_sent BOOLEAN DEFAULT TRUE
+          );
+        `);
+
+        // 3. admin_users table
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS admin_users (
+            id SERIAL PRIMARY KEY,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            salt VARCHAR(255) NOT NULL,
+            full_name VARCHAR(255) NOT NULL,
+            phone VARCHAR(100),
+            role VARCHAR(50) DEFAULT 'SUPER_ADMIN',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP WITH TIME ZONE
+          );
+        `);
+
+        // 4. admin_passkeys table
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS admin_passkeys (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES admin_users(id) ON DELETE CASCADE,
+            credential_id TEXT UNIQUE NOT NULL,
+            public_key TEXT NOT NULL,
+            counter INTEGER DEFAULT 0,
+            device_name VARCHAR(255) DEFAULT 'Biometrischer Fingerabdruck / Passkey',
+            transports TEXT,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            last_used TIMESTAMP WITH TIME ZONE
+          );
+        `);
+
+        // 5. admin_integration_keys table
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS admin_integration_keys (
+            id SERIAL PRIMARY KEY,
+            service_name VARCHAR(100) UNIQUE NOT NULL,
+            credentials TEXT NOT NULL,
+            is_active BOOLEAN DEFAULT TRUE,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+          );
+        `);
+
+        // 6. Seed default admin account
+        const checkUser = await pool.query('SELECT * FROM admin_users WHERE email = $1', ['lunexa.official@gmail.com']);
+        if (checkUser.rows.length === 0) {
+          await pool.query(`
+            INSERT INTO admin_users (email, password_hash, salt, full_name, phone, role)
+            VALUES ($1, $2, $3, $4, $5, $6)
+          `, ['lunexa.official@gmail.com', DEFAULT_HASH, DEFAULT_SALT, 'Aniixa Hauptadministrator', '+49 1520 1234567', 'SUPER_ADMIN']);
+        } else {
+          const existing = checkUser.rows[0];
+          const testHash = hashPassword('Md1620@gmail', existing.salt);
+          if (testHash !== existing.password_hash) {
+            await pool.query('UPDATE admin_users SET password_hash = $1 WHERE id = $2', [testHash, existing.id]);
+          }
+        }
+
+        isDbConnected = true;
+        dbError = null;
+        console.log(`✅ Neon PostgreSQL erfolgreich initialisiert (Versuch ${attempt}).`);
+        return;
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`⚠️ Neon PostgreSQL Verbindungsversuch ${attempt}/${maxAttempts} fehlgeschlagen:`, err.message);
+
+        if (pool) {
+          try {
+            await pool.end().catch(() => {});
+          } catch {}
+          pool = null;
+        }
+
+        if (attempt < maxAttempts) {
+          // Wait 2000ms for Neon cold-start compute spinup
+          await new Promise((r) => setTimeout(r, 2000));
         }
       }
-
-      isDbConnected = true;
-    } catch (err: any) {
-      dbError = err.message;
-      console.warn('⚠️ Neon PostgreSQL Initialisierungsfehler:', err.message);
     }
+
+    isDbConnected = false;
+    dbError = lastError?.message || 'Verbindung fehlgeschlagen';
+    dbInitPromise = null; // Reset promise so subsequent requests can retry
   })();
 
   return dbInitPromise;
 }
+
+// Resilient query helper with automatic reconnect and cold-start retry
+export async function queryWithRetry<T = any>(text: string, params?: any[], maxRetries = 2): Promise<any> {
+  let attempts = 0;
+  while (true) {
+    attempts++;
+    try {
+      if (!pool || !isDbConnected) {
+        await initDatabase();
+      }
+      if (!pool) {
+        throw new Error(dbError || 'PostgreSQL Pool nicht verfügbar');
+      }
+      return await pool.query(text, params);
+    } catch (err: any) {
+      const msg = err.message || '';
+      const isTransient =
+        msg.includes('timeout') ||
+        msg.includes('Connection terminated') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('57P01') ||
+        msg.includes('Connection closed') ||
+        msg.includes('socket hang up') ||
+        msg.includes('Client has encountered');
+
+      if (isTransient && attempts < maxRetries) {
+        console.warn(`[Neon PostgreSQL] Transienter Fehler (${msg}). Auto-Reconnect Versuch ${attempts + 1}/${maxRetries}...`);
+        if (pool) {
+          try {
+            await pool.end().catch(() => {});
+          } catch {}
+          pool = null;
+        }
+        isDbConnected = false;
+        dbInitPromise = null;
+        await new Promise((r) => setTimeout(r, 1500));
+        await initDatabase(true);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 
 // ============================================================
 // 2. AUTHENTICATION & WEBAUTHN CHALLENGE MANAGEMENT
@@ -328,10 +441,10 @@ export function requireAdmin(req: AuthRequest, res: Response, next: NextFunction
 
 // Helper to fetch key from DB or fallback
 async function getStoredIntegrationKey(service: string) {
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      const res = await pool.query('SELECT credentials FROM admin_integration_keys WHERE service_name = $1', [service]);
-      if (res.rows.length > 0) {
+      const res = await queryWithRetry('SELECT credentials FROM admin_integration_keys WHERE service_name = $1', [service]);
+      if (res && res.rows.length > 0) {
         return JSON.parse(res.rows[0].credentials);
       }
     } catch (err) {
@@ -343,9 +456,9 @@ async function getStoredIntegrationKey(service: string) {
 
 async function saveStoredIntegrationKey(service: string, credentials: any) {
   memoryIntegrationKeys[service] = credentials;
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      await pool.query(`
+      await queryWithRetry(`
         INSERT INTO admin_integration_keys (service_name, credentials, is_active, updated_at)
         VALUES ($1, $2, TRUE, NOW())
         ON CONFLICT (service_name)
@@ -379,22 +492,36 @@ router.get('/health', async (req, res) => {
 });
 
 router.get('/db-status', async (req, res) => {
+  const startTime = Date.now();
   await initDatabase();
-  if (pool && isDbConnected) {
+
+  const rawUrl = process.env.DATABASE_URL || '';
+  const isNeon = rawUrl.includes('neon.tech');
+  const isPooled = rawUrl.includes('-pooler');
+
+  if (isDbConnected) {
     try {
-      const result = await pool.query('SELECT COUNT(*) as count FROM enquiries');
+      const result = await queryWithRetry('SELECT COUNT(*) as count FROM enquiries');
+      const latencyMs = Date.now() - startTime;
       return res.json({
         provider: 'Neon PostgreSQL',
         connected: true,
+        latencyMs,
+        isPooled,
         enquiryCount: Number(result.rows[0]?.count || 0),
         envVarName: 'DATABASE_URL',
+        tip: !isPooled && isNeon
+          ? 'Tipp: Für beste Vercel Serverless-Latenz und Vermeidung von Cold-Start Timeouts nutze Neon Connection Pooling (-pooler.neon.tech).'
+          : null,
       });
     } catch (err: any) {
       return res.json({
         provider: 'Neon PostgreSQL',
         connected: false,
         error: err.message,
+        isPooled,
         enquiryCount: memoryEnquiries.length,
+        tip: 'Neon Compute erwacht nach Ruhezustand (Scale-to-Zero). Die Verbindung wird automatisch wiederholt.',
       });
     }
   }
@@ -402,8 +529,13 @@ router.get('/db-status', async (req, res) => {
   res.json({
     provider: 'Neon PostgreSQL (Bereit für DATABASE_URL)',
     connected: false,
+    error: dbError,
+    isPooled,
     enquiryCount: memoryEnquiries.length,
-    note: process.env.DATABASE_URL ? 'Verbinde...' : 'Setze DATABASE_URL in Umgebungsvariablen',
+    note: rawUrl ? 'Verbindungsaufbau oder Neon Ruhezustand (Scale-to-Zero)...' : 'Setze DATABASE_URL in den Vercel Environment Variables',
+    tip: !isPooled && isNeon && rawUrl
+      ? 'Tipp: Nutze die Neon Connection Pooling URL (-pooler.neon.tech) in Vercel.'
+      : null,
   });
 });
 
@@ -432,7 +564,7 @@ router.post('/enquiries', async (req, res) => {
 
   let savedToNeon = false;
 
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
       const query = `
         INSERT INTO enquiries (product_id, product_name, product_price, product_thumbnail, buyer_name, buyer_email, buyer_phone, notes, status, whatsapp_sent)
@@ -440,8 +572,8 @@ router.post('/enquiries', async (req, res) => {
         RETURNING id, created_at;
       `;
       const values = [productId, productName, productPrice || 'Auf Anfrage', productThumbnail || '', buyerName, buyerEmail, buyerPhone, notes || '', 'NEW', true];
-      const result = await pool.query(query, values);
-      if (result.rows.length > 0) {
+      const result = await queryWithRetry(query, values);
+      if (result && result.rows.length > 0) {
         newRecord.id = result.rows[0].id;
         newRecord.created_at = result.rows[0].created_at;
         savedToNeon = true;
@@ -463,9 +595,9 @@ router.post('/enquiries', async (req, res) => {
 
 router.get('/enquiries', async (req, res) => {
   await initDatabase();
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      const result = await pool.query('SELECT * FROM enquiries ORDER BY created_at DESC LIMIT 50');
+      const result = await queryWithRetry('SELECT * FROM enquiries ORDER BY created_at DESC LIMIT 50');
       return res.json({ enquiries: result.rows });
     } catch (err: any) {
       console.warn('Fallback to memory enquiries:', err.message);
@@ -485,15 +617,15 @@ router.post('/admin/login', async (req, res) => {
 
   let matchedUser: any = null;
 
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      const result = await pool.query('SELECT * FROM admin_users WHERE email = $1', [email.trim().toLowerCase()]);
-      if (result.rows.length > 0) {
+      const result = await queryWithRetry('SELECT * FROM admin_users WHERE email = $1', [email.trim().toLowerCase()]);
+      if (result && result.rows.length > 0) {
         const user = result.rows[0];
         const hash = hashPassword(password, user.salt);
         if (hash === user.password_hash) {
           matchedUser = user;
-          await pool.query('UPDATE admin_users SET last_login = NOW() WHERE id = $1', [user.id]);
+          await queryWithRetry('UPDATE admin_users SET last_login = NOW() WHERE id = $1', [user.id]).catch(() => {});
         }
       }
     } catch (e: any) {
@@ -535,10 +667,10 @@ router.get('/admin/me', requireAdmin, async (req: AuthRequest, res) => {
   const userId = req.adminUser!.userId;
   let userRecord: any = null;
 
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      const result = await pool.query('SELECT id, email, full_name, phone, role, created_at, last_login FROM admin_users WHERE id = $1', [userId]);
-      if (result.rows.length > 0) {
+      const result = await queryWithRetry('SELECT id, email, full_name, phone, role, created_at, last_login FROM admin_users WHERE id = $1', [userId]);
+      if (result && result.rows.length > 0) {
         userRecord = result.rows[0];
       }
     } catch (e) {
@@ -580,17 +712,17 @@ router.put('/admin/profile', requireAdmin, async (req: AuthRequest, res) => {
     return res.status(400).json({ error: 'Vollständiger Name erforderlich.' });
   }
 
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
       if (newPassword && newPassword.length >= 6) {
         const newSalt = crypto.randomBytes(16).toString('hex');
         const newHash = hashPassword(newPassword, newSalt);
-        await pool.query(
+        await queryWithRetry(
           'UPDATE admin_users SET full_name = $1, phone = $2, password_hash = $3, salt = $4 WHERE id = $5',
           [fullName.trim(), phone || '', newHash, newSalt, userId]
         );
       } else {
-        await pool.query(
+        await queryWithRetry(
           'UPDATE admin_users SET full_name = $1, phone = $2 WHERE id = $3',
           [fullName.trim(), phone || '', userId]
         );
@@ -659,15 +791,19 @@ router.post('/admin/passkey/register-verify', requireAdmin, async (req: AuthRequ
 
     let passkeyId: any = `pk-${Date.now()}`;
 
-    if (pool && isDbConnected) {
-      const insertRes = await pool.query(
-        `INSERT INTO admin_passkeys (user_id, credential_id, public_key, counter, device_name, transports, last_used)
-         VALUES ($1, $2, $3, $4, $5, $6, NOW())
-         RETURNING id, created_at;`,
-        [userId, credentialId, publicKeyStr, 0, finalDeviceName, transports ? JSON.stringify(transports) : null]
-      );
-      if (insertRes.rows.length > 0) {
-        passkeyId = insertRes.rows[0].id;
+    if (isDbConnected || process.env.DATABASE_URL) {
+      try {
+        const insertRes = await queryWithRetry(
+          `INSERT INTO admin_passkeys (user_id, credential_id, public_key, counter, device_name, transports, last_used)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW())
+           RETURNING id, created_at;`,
+          [userId, credentialId, publicKeyStr, 0, finalDeviceName, transports ? JSON.stringify(transports) : null]
+        );
+        if (insertRes && insertRes.rows.length > 0) {
+          passkeyId = insertRes.rows[0].id;
+        }
+      } catch (dbErr: any) {
+        console.warn('DB passkey save error:', dbErr.message);
       }
     }
 
@@ -698,13 +834,13 @@ router.get('/admin/passkey/list', requireAdmin, async (req: AuthRequest, res) =>
   await initDatabase();
   const userId = req.adminUser!.userId;
 
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      const result = await pool.query(
+      const result = await queryWithRetry(
         'SELECT id, credential_id, device_name, created_at, last_used FROM admin_passkeys WHERE user_id = $1 ORDER BY created_at DESC',
         [userId]
       );
-      return res.json({ passkeys: result.rows });
+      if (result) return res.json({ passkeys: result.rows });
     } catch (e) {
       console.warn('Error fetching passkeys from DB:', e);
     }
@@ -719,9 +855,9 @@ router.delete('/admin/passkey/:id', requireAdmin, async (req: AuthRequest, res) 
   const userId = req.adminUser!.userId;
   const passkeyId = req.params.id;
 
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      await pool.query('DELETE FROM admin_passkeys WHERE id = $1 AND user_id = $2', [passkeyId, userId]);
+      await queryWithRetry('DELETE FROM admin_passkeys WHERE id = $1 AND user_id = $2', [passkeyId, userId]);
     } catch (e: any) {
       return res.status(500).json({ error: e.message });
     }
@@ -742,13 +878,15 @@ router.post('/admin/passkey/login-challenge', async (req, res) => {
 
   let allowCredentials: any[] = [];
 
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      const resPasskeys = await pool.query('SELECT credential_id FROM admin_passkeys LIMIT 20');
-      allowCredentials = resPasskeys.rows.map((r) => ({
-        id: r.credential_id,
-        type: 'public-key',
-      }));
+      const resPasskeys = await queryWithRetry('SELECT credential_id FROM admin_passkeys LIMIT 20');
+      if (resPasskeys) {
+        allowCredentials = resPasskeys.rows.map((r: any) => ({
+          id: r.credential_id,
+          type: 'public-key',
+        }));
+      }
     } catch (e) {
       console.warn('Error reading credential IDs for login:', e);
     }
@@ -792,24 +930,28 @@ router.post('/admin/passkey/login-verify', async (req, res) => {
 
     let matchedUser: any = null;
 
-    if (pool && isDbConnected) {
-      const pkQuery = await pool.query(
-        `SELECT p.*, u.email, u.full_name, u.role
-         FROM admin_passkeys p
-         JOIN admin_users u ON p.user_id = u.id
-         WHERE p.credential_id = $1`,
-        [credentialId]
-      );
-      if (pkQuery.rows.length > 0) {
-        const row = pkQuery.rows[0];
-        matchedUser = {
-          id: row.user_id,
-          email: row.email,
-          fullName: row.full_name,
-          role: row.role,
-        };
-        await pool.query('UPDATE admin_passkeys SET last_used = NOW() WHERE id = $1', [row.id]);
-        await pool.query('UPDATE admin_users SET last_login = NOW() WHERE id = $1', [row.user_id]);
+    if (isDbConnected || process.env.DATABASE_URL) {
+      try {
+        const pkQuery = await queryWithRetry(
+          `SELECT p.*, u.email, u.full_name, u.role
+           FROM admin_passkeys p
+           JOIN admin_users u ON p.user_id = u.id
+           WHERE p.credential_id = $1`,
+          [credentialId]
+        );
+        if (pkQuery && pkQuery.rows.length > 0) {
+          const row = pkQuery.rows[0];
+          matchedUser = {
+            id: row.user_id,
+            email: row.email,
+            fullName: row.full_name,
+            role: row.role,
+          };
+          await queryWithRetry('UPDATE admin_passkeys SET last_used = NOW() WHERE id = $1', [row.id]).catch(() => {});
+          await queryWithRetry('UPDATE admin_users SET last_login = NOW() WHERE id = $1', [row.user_id]).catch(() => {});
+        }
+      } catch (dbErr: any) {
+        console.warn('DB passkey verify error:', dbErr.message);
       }
     }
 
@@ -846,10 +988,10 @@ router.post('/admin/passkey/login-verify', async (req, res) => {
 // D. Admin Enquiries
 router.get('/admin/enquiries', requireAdmin, async (req, res) => {
   await initDatabase();
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      const result = await pool.query('SELECT * FROM enquiries ORDER BY created_at DESC LIMIT 200');
-      return res.json({ enquiries: result.rows });
+      const result = await queryWithRetry('SELECT * FROM enquiries ORDER BY created_at DESC LIMIT 200');
+      if (result) return res.json({ enquiries: result.rows });
     } catch (e: any) {
       console.warn('Error reading admin enquiries:', e.message);
     }
@@ -866,9 +1008,9 @@ router.patch('/admin/enquiries/:id/status', requireAdmin, async (req, res) => {
     return res.status(400).json({ error: 'Ungültiger Statuswert.' });
   }
 
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      await pool.query('UPDATE enquiries SET status = $1 WHERE id = $2', [status, id]);
+      await queryWithRetry('UPDATE enquiries SET status = $1 WHERE id = $2', [status, id]);
     } catch (e: any) {
       console.warn('DB update failed:', e.message);
     }
@@ -884,9 +1026,9 @@ router.delete('/admin/enquiries/:id', requireAdmin, async (req, res) => {
   await initDatabase();
   const { id } = req.params;
 
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      await pool.query('DELETE FROM enquiries WHERE id = $1', [id]);
+      await queryWithRetry('DELETE FROM enquiries WHERE id = $1', [id]);
     } catch (e: any) {
       console.warn('DB delete error:', e.message);
     }
@@ -903,13 +1045,13 @@ router.get('/admin/stats', requireAdmin, async (req, res) => {
   let enquiryCount = memoryEnquiries.length;
   let passkeyCount = memoryPasskeys.length;
 
-  if (pool && isDbConnected) {
+  if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      const enqRes = await pool.query('SELECT COUNT(*) as count FROM enquiries');
-      enquiryCount = Number(enqRes.rows[0]?.count || 0);
+      const enqRes = await queryWithRetry('SELECT COUNT(*) as count FROM enquiries');
+      if (enqRes) enquiryCount = Number(enqRes.rows[0]?.count || 0);
 
-      const pkRes = await pool.query('SELECT COUNT(*) as count FROM admin_passkeys');
-      passkeyCount = Number(pkRes.rows[0]?.count || 0);
+      const pkRes = await queryWithRetry('SELECT COUNT(*) as count FROM admin_passkeys');
+      if (pkRes) passkeyCount = Number(pkRes.rows[0]?.count || 0);
     } catch (e) {
       console.warn('Error fetching stats:', e);
     }
