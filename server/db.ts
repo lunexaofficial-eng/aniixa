@@ -33,6 +33,37 @@ export interface AdminPasskey {
   last_used: string | null;
 }
 
+export interface CloudflareR2Config {
+  accountId: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucketName: string;
+  publicUrl: string;
+  endpoint?: string;
+  updatedAt?: string;
+}
+
+export interface ResendConfig {
+  apiKey: string;
+  fromEmail: string;
+  updatedAt?: string;
+}
+
+export interface ResendDomainItem {
+  id: string;
+  domain: string;
+  status: 'VERIFIED' | 'PENDING' | 'FAILED';
+  region?: string;
+  createdAt: string;
+  records?: Array<{
+    type: string;
+    name: string;
+    value: string;
+    ttl: string;
+    status: string;
+  }>;
+}
+
 export interface EnquiryRecord {
   id: number | string;
   product_id: string;
@@ -51,6 +82,24 @@ export interface EnquiryRecord {
 // In-Memory Fallbacks if Neon DB is not reachable
 export const memoryEnquiries: EnquiryRecord[] = [];
 export const memoryPasskeys: AdminPasskey[] = [];
+export const memoryIntegrationKeys: Record<string, any> = {
+  cloudflare_r2: null,
+  resend: null,
+  resend_domains: [
+    {
+      id: 'dom_default_aniixa',
+      domain: 'aniixa.de',
+      status: 'VERIFIED',
+      region: 'eu-west-1 (Frankfurt)',
+      createdAt: new Date().toISOString(),
+      records: [
+        { type: 'TXT', name: '_dmarc.aniixa.de', value: 'v=DMARC1; p=none;', ttl: 'Auto', status: 'VERIFIED' },
+        { type: 'TXT', name: 'resend._domainkey.aniixa.de', value: 'p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC...', ttl: 'Auto', status: 'VERIFIED' },
+        { type: 'MX', name: 'mail.aniixa.de', value: 'feedback-smtp.eu-west-1.amazonses.com', ttl: 'Auto', status: 'VERIFIED' },
+      ],
+    },
+  ],
+};
 
 // Hash helper for admin password
 export function hashPassword(password: string, salt: string): string {
@@ -136,7 +185,18 @@ export async function initDatabase(): Promise<void> {
       );
     `);
 
-    // 4. Ensure admin user lunexa.official@gmail.com exists with password Md1620@gmail
+    // 4. Create admin_integration_keys table for Cloudflare R2 and Resend.com keys
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_integration_keys (
+        id SERIAL PRIMARY KEY,
+        service_name VARCHAR(100) UNIQUE NOT NULL,
+        credentials TEXT NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // 5. Ensure admin user lunexa.official@gmail.com exists with password Md1620@gmail
     const checkUser = await pool.query('SELECT * FROM admin_users WHERE email = $1', ['lunexa.official@gmail.com']);
     if (checkUser.rows.length === 0) {
       await pool.query(`

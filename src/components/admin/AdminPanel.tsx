@@ -30,6 +30,7 @@ import {
   isPlatformAuthenticatorAvailable,
   registerFingerprintPasskey
 } from '../../utils/webauthn';
+import { KeysManagement } from './KeysManagement';
 
 interface AdminPanelProps {
   token: string;
@@ -38,7 +39,7 @@ interface AdminPanelProps {
   onReturnToMarket: () => void;
 }
 
-type AdminTab = 'dashboard' | 'enquiries' | 'products' | 'profile' | 'security';
+type AdminTab = 'dashboard' | 'enquiries' | 'products' | 'keys' | 'profile' | 'security';
 
 export const AdminPanel: React.FC<AdminPanelProps> = ({
   token,
@@ -263,6 +264,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     { id: 'dashboard', label: 'Dashboard', icon: <Activity className="w-3.5 h-3.5" /> },
     { id: 'enquiries', label: `Anfragen (${enquiries.length})`, icon: <MessageSquare className="w-3.5 h-3.5" /> },
     { id: 'products', label: 'Reagenzien & Bestand', icon: <Package className="w-3.5 h-3.5" /> },
+    { id: 'keys', label: 'Keys & Storage', icon: <Key className="w-3.5 h-3.5" /> },
     { id: 'profile', label: 'Admin-Profil', icon: <User className="w-3.5 h-3.5" /> },
     { id: 'security', label: `Sicherheit & Passkeys (${passkeys.length})`, icon: <Fingerprint className="w-3.5 h-3.5" /> },
   ];
@@ -702,7 +704,14 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         )}
 
         {/* ------------------------------------------------------------- */}
-        {/* TAB 4: ADMIN PROFILE MANAGEMENT */}
+        {/* TAB 4: KEYS & STORAGE MANAGEMENT */}
+        {/* ------------------------------------------------------------- */}
+        {activeTab === 'keys' && (
+          <KeysManagement token={token} />
+        )}
+
+        {/* ------------------------------------------------------------- */}
+        {/* TAB 5: ADMIN PROFILE MANAGEMENT */}
         {/* ------------------------------------------------------------- */}
         {activeTab === 'profile' && (
           <div className="max-w-2xl mx-auto space-y-6 animate-in fade-in duration-200">
