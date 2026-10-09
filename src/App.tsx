@@ -141,6 +141,11 @@ export default function App() {
   // Filter products by search query, category, and grade
   const filteredProducts = useMemo(() => {
     return productsList.filter((prod) => {
+      // Hide unpublished products from public storefront
+      if (prod.published === false) {
+        return false;
+      }
+
       // Category filter
       if (selectedCategory !== 'Alle' && prod.category !== selectedCategory) {
         return false;

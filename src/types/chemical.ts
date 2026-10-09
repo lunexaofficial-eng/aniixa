@@ -64,7 +64,9 @@ export interface ChemicalProduct {
     special: string; // 'OX', 'W', 'SA', ''
   };
   ghsPictograms?: ('toxic' | 'corrosive' | 'flammable' | 'environment' | 'irritant' | 'safe')[];
+  published?: boolean;
   createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface EnquirySubmission {

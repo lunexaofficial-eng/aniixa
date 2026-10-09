@@ -302,6 +302,12 @@ export async function initDatabase(forceRetry = false): Promise<void> {
           );
         `);
 
+        // Ensure is_published and updated_at columns exist
+        await pool.query(`
+          ALTER TABLE chemical_products ADD COLUMN IF NOT EXISTS is_published BOOLEAN DEFAULT TRUE;
+          ALTER TABLE chemical_products ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+        `);
+
         // 6. Seed default admin account
         const checkUser = await pool.query('SELECT * FROM admin_users WHERE email = $1', ['lunexa.official@gmail.com']);
         if (checkUser.rows.length === 0) {
@@ -1644,9 +1650,13 @@ let fallbackProducts: any[] = [];
 
 router.get('/products', async (req, res) => {
   await initDatabase();
+  const includeUnpublished = req.query.all === 'true';
   if (isDbConnected || process.env.DATABASE_URL) {
     try {
-      const result = await queryWithRetry('SELECT * FROM chemical_products ORDER BY created_at DESC');
+      const sql = includeUnpublished
+        ? 'SELECT * FROM chemical_products ORDER BY created_at DESC'
+        : 'SELECT * FROM chemical_products WHERE is_published = TRUE OR is_published IS NULL ORDER BY created_at DESC';
+      const result = await queryWithRetry(sql);
       if (result && result.rows.length > 0) {
         const defaultChemImg = 'https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=600&q=80';
         const formatted = result.rows.map((row: any) => {
@@ -1673,31 +1683,32 @@ router.get('/products', async (req, res) => {
             thumbnail: safeThumbnail,
             thumbnails: validRowThumbs.length > 0 ? validRowThumbs : [safeThumbnail],
             primaryThumbnail: safeThumbnail,
-          category: row.category,
-          inStock: row.in_stock,
-          stockUnits: row.stock_units,
-          physicalState: row.physical_state,
-          leadTime: '1–2 Werktage',
-          packaging: row.packaging,
-          unNumber: row.un_number,
-          hazardSummary: row.hazard_summary,
-          description: row.description,
-          applications: row.applications || [],
-          sdsDocumentUrl: row.sds_document_url,
-          sdsDocumentName: row.sds_document_name,
-          demoVideoUrl: row.demo_video_url,
-          meltingPoint: row.melting_point,
-          boilingPoint: row.boiling_point,
-          nfpaDiamond: {
-            health: row.nfpa_health || 0,
-            flammability: row.nfpa_flammability || 0,
-            instability: row.nfpa_instability || 0,
-            special: row.nfpa_special || '',
-          },
-          ghsPictograms: row.ghs_pictograms || [],
-          createdAt: row.created_at,
-        };
-      });
+            category: row.category,
+            inStock: row.in_stock,
+            stockUnits: row.stock_units,
+            physicalState: row.physical_state,
+            leadTime: '1–2 Werktage',
+            packaging: row.packaging,
+            unNumber: row.un_number,
+            hazardSummary: row.hazard_summary,
+            description: row.description,
+            applications: row.applications || [],
+            sdsDocumentUrl: row.sds_document_url,
+            sdsDocumentName: row.sds_document_name,
+            demoVideoUrl: row.demo_video_url,
+            meltingPoint: row.melting_point,
+            boilingPoint: row.boiling_point,
+            nfpaDiamond: {
+              health: row.nfpa_health || 0,
+              flammability: row.nfpa_flammability || 0,
+              instability: row.nfpa_instability || 0,
+              special: row.nfpa_special || '',
+            },
+            ghsPictograms: row.ghs_pictograms || [],
+            published: row.is_published !== false,
+            createdAt: row.created_at,
+          };
+        });
         return res.json({ products: formatted, source: 'database' });
       }
     } catch (err: any) {
@@ -1705,7 +1716,8 @@ router.get('/products', async (req, res) => {
     }
   }
 
-  return res.json({ products: fallbackProducts, source: 'fallback' });
+  const list = includeUnpublished ? fallbackProducts : fallbackProducts.filter((p) => p.published !== false);
+  return res.json({ products: list, source: 'fallback' });
 });
 
 router.post('/admin/products/bulk', requireAdmin, async (req, res) => {
@@ -1881,6 +1893,258 @@ router.post('/admin/products/bulk', requireAdmin, async (req, res) => {
     savedProducts,
     errors: errors.length > 0 ? errors : undefined,
     message: `${savedProducts.length} Chemikalien erfolgreich ${isDbConnected ? 'in Neon PostgreSQL' : 'im Katalog'} veröffentlicht!`,
+  });
+});
+
+// Get all products for admin management (including published & unpublished)
+router.get('/admin/products', requireAdmin, async (req, res) => {
+  await initDatabase();
+  if (isDbConnected || process.env.DATABASE_URL) {
+    try {
+      const result = await queryWithRetry('SELECT * FROM chemical_products ORDER BY created_at DESC');
+      if (result && result.rows.length > 0) {
+        const defaultChemImg = 'https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=600&q=80';
+        const formatted = result.rows.map((row: any) => {
+          const rawThumbs = Array.isArray(row.thumbnails) ? row.thumbnails : [];
+          const validRowThumbs = rawThumbs.filter((t: any) => typeof t === 'string' && t.trim().length > 0);
+          const safeThumbnail =
+            (row.thumbnail && row.thumbnail.trim()) ||
+            (row.primary_thumbnail && row.primary_thumbnail.trim()) ||
+            (validRowThumbs.length > 0 ? validRowThumbs[0] : '') ||
+            defaultChemImg;
+
+          return {
+            id: row.id,
+            casNumber: row.cas_number,
+            name: row.name,
+            iupacName: row.iupac_name,
+            formula: row.formula,
+            molarMass: row.molar_mass,
+            grade: row.grade,
+            purity: row.purity,
+            price: row.price,
+            unit: row.unit,
+            pricePerLiterOrKg: row.price_per_unit || row.price,
+            thumbnail: safeThumbnail,
+            thumbnails: validRowThumbs.length > 0 ? validRowThumbs : [safeThumbnail],
+            primaryThumbnail: safeThumbnail,
+            category: row.category,
+            inStock: row.in_stock,
+            stockUnits: row.stock_units,
+            physicalState: row.physical_state,
+            leadTime: '1–2 Werktage',
+            packaging: row.packaging,
+            unNumber: row.un_number,
+            hazardSummary: row.hazard_summary,
+            description: row.description,
+            applications: row.applications || [],
+            sdsDocumentUrl: row.sds_document_url,
+            sdsDocumentName: row.sds_document_name,
+            demoVideoUrl: row.demo_video_url,
+            meltingPoint: row.melting_point,
+            boilingPoint: row.boiling_point,
+            nfpaDiamond: {
+              health: row.nfpa_health || 0,
+              flammability: row.nfpa_flammability || 0,
+              instability: row.nfpa_instability || 0,
+              special: row.nfpa_special || '',
+            },
+            ghsPictograms: row.ghs_pictograms || [],
+            published: row.is_published !== false,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+          };
+        });
+        return res.json({ products: formatted, source: 'database' });
+      }
+    } catch (err: any) {
+      console.warn('⚠️ Fetching admin products from DB failed:', err.message);
+    }
+  }
+
+  return res.json({ products: fallbackProducts, source: 'fallback' });
+});
+
+// Update / Edit an existing chemical product
+router.put('/admin/products/:id', requireAdmin, async (req, res) => {
+  await initDatabase();
+  const { id } = req.params;
+  const p = req.body;
+
+  if (!p || !p.name) {
+    return res.status(400).json({ error: 'Ungültige Produktdaten. Der Name ist erforderlich.' });
+  }
+
+  const rawThumbs = Array.isArray(p.thumbnails) ? p.thumbnails : [];
+  const validThumbs = rawThumbs.filter((t: any) => Boolean(t && typeof t === 'string' && t.trim()));
+  const fallbackThumb = 'https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=600&q=80';
+  const primaryThumb = p.primaryThumbnail || (validThumbs.length > 0 ? validThumbs[0] : fallbackThumb);
+  const isPublished = p.published !== false;
+
+  const productRecord = {
+    id,
+    casNumber: (p.casNumber || '').trim() || 'N/A',
+    name: (p.name || '').trim(),
+    iupacName: (p.iupacName || p.name || '').trim(),
+    formula: (p.formula || '').trim(),
+    molarMass: (p.molarMass || p.molecularWeight || '').trim(),
+    grade: p.grade || 'ACS Reagent',
+    purity: (p.purity || '').trim() || '≥ 99.8%',
+    price: (p.price || '').startsWith('$') ? p.price : `$ ${(p.price || '0.00').replace(/^\$?\s*/, '')}`,
+    unit: (p.unit || '').trim(),
+    pricePerLiterOrKg: p.pricePerLiterOrKg || p.price,
+    thumbnail: primaryThumb,
+    thumbnails: validThumbs.length > 0 ? validThumbs : [primaryThumb],
+    primaryThumbnail: primaryThumb,
+    category: p.category || 'Solvents',
+    inStock: Boolean(p.inStock !== false && (Number(p.stockUnits) || 0) > 0),
+    stockUnits: Number(p.stockUnits) || 0,
+    physicalState: p.physicalState || 'Flüssig (Liquid)',
+    packaging: p.packaging || p.unit || '',
+    unNumber: p.unNumber || '',
+    hazardSummary: p.hazardSummary || '',
+    description: (p.description || '').trim(),
+    applications: Array.isArray(p.applications) ? p.applications : [],
+    sdsDocumentUrl: p.sdsDocumentUrl || '',
+    sdsDocumentName: p.sdsDocumentName || '',
+    demoVideoUrl: p.demoVideoUrl || '',
+    meltingPoint: (p.meltingPoint || '').trim(),
+    boilingPoint: (p.boilingPoint || '').trim(),
+    nfpaDiamond: {
+      health: Number(p.nfpaDiamond?.health ?? p.nfpaHealth ?? 0),
+      flammability: Number(p.nfpaDiamond?.flammability ?? p.nfpaFlammability ?? 0),
+      instability: Number(p.nfpaDiamond?.instability ?? p.nfpaInstability ?? 0),
+      special: p.nfpaDiamond?.special || p.nfpaSpecial || '',
+    },
+    ghsPictograms: Array.isArray(p.ghsPictograms) ? p.ghsPictograms : [],
+    published: isPublished,
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (isDbConnected || process.env.DATABASE_URL) {
+    try {
+      await queryWithRetry(`
+        UPDATE chemical_products SET
+          cas_number = $2,
+          name = $3,
+          iupac_name = $4,
+          formula = $5,
+          molar_mass = $6,
+          grade = $7,
+          purity = $8,
+          price = $9,
+          unit = $10,
+          price_per_unit = $11,
+          thumbnail = $12,
+          thumbnails = $13,
+          primary_thumbnail = $14,
+          category = $15,
+          in_stock = $16,
+          stock_units = $17,
+          physical_state = $18,
+          packaging = $19,
+          un_number = $20,
+          hazard_summary = $21,
+          description = $22,
+          applications = $23,
+          sds_document_url = $24,
+          sds_document_name = $25,
+          demo_video_url = $26,
+          melting_point = $27,
+          boiling_point = $28,
+          nfpa_health = $29,
+          nfpa_flammability = $30,
+          nfpa_instability = $31,
+          nfpa_special = $32,
+          ghs_pictograms = $33,
+          is_published = $34,
+          updated_at = NOW()
+        WHERE id = $1
+      `, [
+        id,
+        productRecord.casNumber,
+        productRecord.name,
+        productRecord.iupacName,
+        productRecord.formula,
+        productRecord.molarMass,
+        productRecord.grade,
+        productRecord.purity,
+        productRecord.price,
+        productRecord.unit,
+        productRecord.pricePerLiterOrKg,
+        productRecord.thumbnail,
+        productRecord.thumbnails,
+        productRecord.primaryThumbnail,
+        productRecord.category,
+        productRecord.inStock,
+        productRecord.stockUnits,
+        productRecord.physicalState,
+        productRecord.packaging,
+        productRecord.unNumber,
+        productRecord.hazardSummary,
+        productRecord.description,
+        productRecord.applications,
+        productRecord.sdsDocumentUrl,
+        productRecord.sdsDocumentName,
+        productRecord.demoVideoUrl,
+        productRecord.meltingPoint,
+        productRecord.boilingPoint,
+        productRecord.nfpaDiamond.health,
+        productRecord.nfpaDiamond.flammability,
+        productRecord.nfpaDiamond.instability,
+        productRecord.nfpaDiamond.special,
+        productRecord.ghsPictograms,
+        isPublished,
+      ]);
+    } catch (err: any) {
+      console.warn('DB update product error:', err.message);
+    }
+  }
+
+  // Update in fallback array
+  const fIdx = fallbackProducts.findIndex((fp) => fp.id === id);
+  if (fIdx !== -1) {
+    fallbackProducts[fIdx] = { ...fallbackProducts[fIdx], ...productRecord };
+  } else {
+    fallbackProducts.unshift(productRecord);
+  }
+
+  return res.json({
+    success: true,
+    message: `Produkt ${productRecord.name} (${id}) erfolgreich aktualisiert.`,
+    product: productRecord,
+  });
+});
+
+// Toggle or update publish status
+router.patch('/admin/products/:id/publish-status', requireAdmin, async (req, res) => {
+  await initDatabase();
+  const { id } = req.params;
+  const { published } = req.body;
+
+  const targetPublished = Boolean(published);
+
+  if (isDbConnected || process.env.DATABASE_URL) {
+    try {
+      await queryWithRetry(`
+        UPDATE chemical_products
+        SET is_published = $2, updated_at = NOW()
+        WHERE id = $1
+      `, [id, targetPublished]);
+    } catch (err: any) {
+      console.warn('DB toggle publish status error:', err.message);
+    }
+  }
+
+  const fIdx = fallbackProducts.findIndex((fp) => fp.id === id);
+  if (fIdx !== -1) {
+    fallbackProducts[fIdx].published = targetPublished;
+  }
+
+  return res.json({
+    success: true,
+    published: targetPublished,
+    message: `Produkt ${id} wurde ${targetPublished ? 'veröffentlicht' : 'auf Entwurf / unveröffentlicht gesetzt'}.`,
   });
 });
 
