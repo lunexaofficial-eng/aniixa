@@ -166,7 +166,17 @@ export default function App() {
     });
   }, [productsList, searchQuery, selectedCategory, selectedGrade]);
 
-  const grades = ['Alle', 'p.a. (pro analysi)', 'Ph. Eur. / DAB', 'ACS Reagent'];
+  const grades = [
+    'Alle',
+    'ACS Reagent',
+    'USP Grade',
+    'AR Grade',
+    'p.a. (pro analysi)',
+    'Ph. Eur. / DAB',
+    'Technical Grade',
+    'Educational Grade',
+    'Pure / Reinst',
+  ];
 
   // Handle open admin
   const handleOpenAdmin = () => {

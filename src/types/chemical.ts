@@ -5,13 +5,34 @@ export interface ChemicalProduct {
   iupacName: string; // e.g. "Ethanol"
   formula: string; // e.g. "C2H5OH"
   molarMass: string; // e.g. "46.07 g/mol"
-  grade: 'p.a. (pro analysi)' | 'Ph. Eur. / DAB' | 'ACS Reagent' | 'Reinst (Pure)';
+  grade:
+    | 'p.a. (pro analysi)'
+    | 'Ph. Eur. / DAB'
+    | 'ACS Reagent'
+    | 'Reinst (Pure)'
+    | 'USP Grade'
+    | 'Technical Grade'
+    | 'Educational Grade'
+    | 'AR Grade'
+    | string;
   purity: string; // e.g. ">= 99.8%"
   price: string; // e.g. "€ 28.50"
   unit: string; // e.g. "1.000 ml"
   pricePerLiterOrKg: string; // e.g. "€ 28.50 / L"
   thumbnail: string; // image path
-  category: 'Solvents' | 'Acids & Bases' | 'Salts & Reagents' | 'Organic Compounds' | 'Buffering & Pure Reagents';
+  category:
+    | 'Solvents'
+    | 'Acids & Bases'
+    | 'Salts & Reagents'
+    | 'Organic Compounds'
+    | 'Buffering & Pure Reagents'
+    | 'Buffers'
+    | 'Glassware'
+    | 'Indicators'
+    | 'Laboratory Reagent'
+    | 'Reagents'
+    | 'Analytical & Pure Reagents'
+    | string;
   inStock: boolean;
   leadTime: string; // e.g. "1-2 Werktage"
   packaging: string; // e.g. "Glasflasche DIN GL45" or "HDPE Kanister"
@@ -20,7 +41,14 @@ export interface ChemicalProduct {
   description: string;
   applications: string[];
   // Extended properties for bulk uploads & comprehensive specs
-  physicalState?: 'Flüssig (Liquid)' | 'Feststoff / Pulver (Solid/Powder)' | 'Kristallin (Crystalline)' | 'Gasförmig (Gas)';
+  physicalState?:
+    | 'Flüssig (Liquid)'
+    | 'Feststoff (Solid)'
+    | 'Kristallin / Pulver (Crystalline/Powder)'
+    | 'Gasförmig (Gas)'
+    | 'Feststoff / Pulver (Solid/Powder)'
+    | 'Kristallin (Crystalline)'
+    | string;
   stockUnits?: number;
   thumbnails?: string[];
   primaryThumbnail?: string;
