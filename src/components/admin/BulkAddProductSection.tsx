@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Plus,
   Trash2,
@@ -17,9 +17,24 @@ import {
   FlaskConical,
   Sparkles,
   Check,
-  PackageCheck
+  PackageCheck,
+  Cloud,
+  ExternalLink,
+  Film,
+  Eye,
+  RefreshCw,
+  Loader2
 } from 'lucide-react';
 import { ChemicalProduct } from '../../types/chemical';
+import {
+  checkR2Status,
+  uploadFileToR2,
+  R2StatusInfo,
+  UploadProgressEvent,
+  UploadStatus,
+  formatFileSize,
+} from '../../services/r2UploadService';
+import { R2UploadProgressBar } from './R2UploadProgressBar';
 
 export const REAGENT_CATEGORIES = [
   'Solvents',
@@ -93,6 +108,23 @@ export interface BulkChemicalItem {
   };
 }
 
+interface UploadTask {
+  id: string;
+  file: File;
+  name: string;
+  type: 'image' | 'pdf' | 'video';
+  progress: UploadProgressEvent | null;
+  status: UploadStatus;
+  errorMessage?: string;
+  cancel?: () => void;
+}
+
+interface ItemUploads {
+  thumbnails: UploadTask[];
+  sds: UploadTask | null;
+  video: UploadTask | null;
+}
+
 interface BulkAddProductSectionProps {
   token: string;
   onPublishedSuccess: (products: ChemicalProduct[]) => void;
@@ -150,6 +182,27 @@ export const BulkAddProductSection: React.FC<BulkAddProductSectionProps> = ({
   const [expandedIndex, setExpandedIndex] = useState<number | null>(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  
+  // Cloudflare R2 Live Status
+  const [r2Info, setR2Info] = useState<R2StatusInfo | null>(null);
+  const [isCheckingR2, setIsCheckingR2] = useState(false);
+
+  // Active uploads per item ID
+  const [uploadTasks, setUploadTasks] = useState<Record<string, ItemUploads>>({});
+
+  useEffect(() => {
+    refreshR2Status();
+  }, []);
+
+  const refreshR2Status = async () => {
+    setIsCheckingR2(true);
+    try {
+      const status = await checkR2Status();
+      setR2Info(status);
+    } finally {
+      setIsCheckingR2(false);
+    }
+  };
 
   // Field reference updater for specific item slot
   const updateItemField = <K extends keyof BulkChemicalItem>(
@@ -198,77 +251,347 @@ export const BulkAddProductSection: React.FC<BulkAddProductSectionProps> = ({
     }
   };
 
-  // Multi-thumbnail upload
+  // Production Multi-thumbnail upload directly to Cloudflare R2
   const handleThumbnailUpload = (index: number, e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    const readers: Promise<string>[] = [];
-    Array.from(files).forEach((file) => {
-      readers.push(
-        new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.readAsDataURL(file);
-        })
-      );
-    });
+    const currentItem = items[index];
+    if (!currentItem) return;
+    const itemId = currentItem.id;
 
-    Promise.all(readers).then((newUrls) => {
-      setItems((prev) => {
-        const copy = [...prev];
-        const currentThumbnails = copy[index].thumbnails || [];
-        copy[index] = {
-          ...copy[index],
-          thumbnails: [...currentThumbnails, ...newUrls],
+    const fileList = Array.from(files);
+    e.target.value = ''; // Reset input so same file can be re-selected if needed
+
+    fileList.forEach((file) => {
+      const taskId = `thumb_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      
+      const newTask: UploadTask = {
+        id: taskId,
+        file,
+        name: file.name,
+        type: 'image',
+        progress: {
+          percent: 0,
+          loaded: 0,
+          total: file.size,
+          speedFormatted: 'Startet...',
+          sizeFormatted: `0 B / ${formatFileSize(file.size)}`,
+        },
+        status: 'uploading',
+      };
+
+      // Add to tracking
+      setUploadTasks((prev) => {
+        const itemUploads = prev[itemId] || { thumbnails: [], sds: null, video: null };
+        return {
+          ...prev,
+          [itemId]: {
+            ...itemUploads,
+            thumbnails: [...itemUploads.thumbnails, newTask],
+          },
         };
-        return copy;
       });
+
+      const handle = uploadFileToR2(file, {
+        folder: 'thumbnails',
+        token,
+        onProgress: (prog) => {
+          setUploadTasks((prev) => {
+            const itemUploads = prev[itemId];
+            if (!itemUploads) return prev;
+            return {
+              ...prev,
+              [itemId]: {
+                ...itemUploads,
+                thumbnails: itemUploads.thumbnails.map((t) =>
+                  t.id === taskId ? { ...t, progress: prog, status: 'uploading' } : t
+                ),
+              },
+            };
+          });
+        },
+        onStatusChange: (status, message) => {
+          setUploadTasks((prev) => {
+            const itemUploads = prev[itemId];
+            if (!itemUploads) return prev;
+            return {
+              ...prev,
+              [itemId]: {
+                ...itemUploads,
+                thumbnails: itemUploads.thumbnails.map((t) =>
+                  t.id === taskId ? { ...t, status, errorMessage: status === 'error' ? message : undefined } : t
+                ),
+              },
+            };
+          });
+        },
+      });
+
+      // Save cancel handle
+      newTask.cancel = handle.cancel;
+
+      handle.promise
+        .then((result) => {
+          // Add verified permanent R2 URL to the chemical item
+          setItems((prevItems) => {
+            const copy = [...prevItems];
+            if (!copy[index]) return prevItems;
+            const currentThumbs = copy[index].thumbnails || [];
+            // Prefer resilient proxy or CDN URL
+            const finalUrl = result.url || result.proxyUrl;
+            copy[index] = {
+              ...copy[index],
+              thumbnails: [...currentThumbs, finalUrl],
+            };
+            return copy;
+          });
+
+          // Remove completed task after short celebration display
+          setTimeout(() => {
+            setUploadTasks((prev) => {
+              const itemUploads = prev[itemId];
+              if (!itemUploads) return prev;
+              return {
+                ...prev,
+                [itemId]: {
+                  ...itemUploads,
+                  thumbnails: itemUploads.thumbnails.filter((t) => t.id !== taskId),
+                },
+              };
+            });
+          }, 1200);
+        })
+        .catch((err) => {
+          console.error('Thumbnail upload error:', err);
+        });
     });
   };
 
-  // Handle SDS document upload
+  // Production SDS Document PDF upload directly to Cloudflare R2
   const handleSdsUpload = (index: number, e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      setItems((prev) => {
-        const copy = [...prev];
-        copy[index] = {
-          ...copy[index],
-          sdsDocumentUrl: reader.result as string,
-          sdsDocumentName: file.name,
-        };
-        return copy;
-      });
+    const currentItem = items[index];
+    if (!currentItem) return;
+    const itemId = currentItem.id;
+    e.target.value = '';
+
+    const taskId = `sds_${Date.now()}`;
+    const newTask: UploadTask = {
+      id: taskId,
+      file,
+      name: file.name,
+      type: 'pdf',
+      progress: {
+        percent: 0,
+        loaded: 0,
+        total: file.size,
+        speedFormatted: 'Startet...',
+        sizeFormatted: `0 B / ${formatFileSize(file.size)}`,
+      },
+      status: 'uploading',
     };
-    reader.readAsDataURL(file);
+
+    setUploadTasks((prev) => {
+      const itemUploads = prev[itemId] || { thumbnails: [], sds: null, video: null };
+      return {
+        ...prev,
+        [itemId]: {
+          ...itemUploads,
+          sds: newTask,
+        },
+      };
+    });
+
+    const handle = uploadFileToR2(file, {
+      folder: 'sds',
+      token,
+      onProgress: (prog) => {
+        setUploadTasks((prev) => {
+          const itemUploads = prev[itemId];
+          if (!itemUploads || !itemUploads.sds) return prev;
+          return {
+            ...prev,
+            [itemId]: {
+              ...itemUploads,
+              sds: { ...itemUploads.sds, progress: prog, status: 'uploading' },
+            },
+          };
+        });
+      },
+      onStatusChange: (status, message) => {
+        setUploadTasks((prev) => {
+          const itemUploads = prev[itemId];
+          if (!itemUploads || !itemUploads.sds) return prev;
+          return {
+            ...prev,
+            [itemId]: {
+              ...itemUploads,
+              sds: { ...itemUploads.sds, status, errorMessage: status === 'error' ? message : undefined },
+            },
+          };
+        });
+      },
+    });
+
+    newTask.cancel = handle.cancel;
+
+    handle.promise
+      .then((result) => {
+        const finalUrl = result.url || result.proxyUrl;
+        setItems((prevItems) => {
+          const copy = [...prevItems];
+          if (!copy[index]) return prevItems;
+          copy[index] = {
+            ...copy[index],
+            sdsDocumentUrl: finalUrl,
+            sdsDocumentName: file.name,
+          };
+          return copy;
+        });
+
+        setTimeout(() => {
+          setUploadTasks((prev) => {
+            const itemUploads = prev[itemId];
+            if (!itemUploads) return prev;
+            return {
+              ...prev,
+              [itemId]: {
+                ...itemUploads,
+                sds: null,
+              },
+            };
+          });
+        }, 1200);
+      })
+      .catch((err) => {
+        console.error('SDS upload error:', err);
+      });
   };
 
-  // Handle Demo Video upload
+  // Production Demonstration Video upload directly to Cloudflare R2
   const handleVideoUpload = (index: number, e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      setItems((prev) => {
-        const copy = [...prev];
-        copy[index] = {
-          ...copy[index],
-          demoVideoUrl: reader.result as string,
-        };
-        return copy;
-      });
+    const currentItem = items[index];
+    if (!currentItem) return;
+    const itemId = currentItem.id;
+    e.target.value = '';
+
+    const taskId = `video_${Date.now()}`;
+    const newTask: UploadTask = {
+      id: taskId,
+      file,
+      name: file.name,
+      type: 'video',
+      progress: {
+        percent: 0,
+        loaded: 0,
+        total: file.size,
+        speedFormatted: 'Startet...',
+        sizeFormatted: `0 B / ${formatFileSize(file.size)}`,
+      },
+      status: 'uploading',
     };
-    reader.readAsDataURL(file);
+
+    setUploadTasks((prev) => {
+      const itemUploads = prev[itemId] || { thumbnails: [], sds: null, video: null };
+      return {
+        ...prev,
+        [itemId]: {
+          ...itemUploads,
+          video: newTask,
+        },
+      };
+    });
+
+    const handle = uploadFileToR2(file, {
+      folder: 'videos',
+      token,
+      onProgress: (prog) => {
+        setUploadTasks((prev) => {
+          const itemUploads = prev[itemId];
+          if (!itemUploads || !itemUploads.video) return prev;
+          return {
+            ...prev,
+            [itemId]: {
+              ...itemUploads,
+              video: { ...itemUploads.video, progress: prog, status: 'uploading' },
+            },
+          };
+        });
+      },
+      onStatusChange: (status, message) => {
+        setUploadTasks((prev) => {
+          const itemUploads = prev[itemId];
+          if (!itemUploads || !itemUploads.video) return prev;
+          return {
+            ...prev,
+            [itemId]: {
+              ...itemUploads,
+              video: { ...itemUploads.video, status, errorMessage: status === 'error' ? message : undefined },
+            },
+          };
+        });
+      },
+    });
+
+    newTask.cancel = handle.cancel;
+
+    handle.promise
+      .then((result) => {
+        const finalUrl = result.url || result.proxyUrl;
+        setItems((prevItems) => {
+          const copy = [...prevItems];
+          if (!copy[index]) return prevItems;
+          copy[index] = {
+            ...copy[index],
+            demoVideoUrl: finalUrl,
+          };
+          return copy;
+        });
+
+        setTimeout(() => {
+          setUploadTasks((prev) => {
+            const itemUploads = prev[itemId];
+            if (!itemUploads) return prev;
+            return {
+              ...prev,
+              [itemId]: {
+                ...itemUploads,
+                video: null,
+              },
+            };
+          });
+        }, 1200);
+      })
+      .catch((err) => {
+        console.error('Video upload error:', err);
+      });
   };
+
+  // Check if any upload is in progress across all slots
+  const hasActiveUploads = Object.values(uploadTasks).some(
+    (tasks) =>
+      tasks.thumbnails.some((t) => t.status === 'uploading' || t.status === 'verifying') ||
+      (tasks.sds && (tasks.sds.status === 'uploading' || tasks.sds.status === 'verifying')) ||
+      (tasks.video && (tasks.video.status === 'uploading' || tasks.video.status === 'verifying'))
+  );
 
   // One-click publish all products
   const handlePublishAll = async () => {
     setNotice(null);
+
+    if (hasActiveUploads) {
+      setNotice({
+        type: 'error',
+        text: 'Bitte warten Sie, bis alle Dateien vollständig zu Cloudflare R2 übertragen wurden.',
+      });
+      return;
+    }
 
     // Validate that every product has at least a Chemical Name
     const emptyNames = items.filter((item) => !item.name.trim());
@@ -351,20 +674,21 @@ export const BulkAddProductSection: React.FC<BulkAddProductSectionProps> = ({
 
       setNotice({
         type: 'success',
-        text: `Erfolgreich veröffentlicht! ${data.publishedCount} Chemikalien wurden im System & in der Neon PostgreSQL-Datenbank hinterlegt.`,
+        text: `Erfolgreich veröffentlicht! ${data.publishedCount} Chemikalien mit verifizierten Cloudflare R2 Medien wurden im System & in der Datenbank hinterlegt.`,
       });
 
       if (data.savedProducts && onPublishedSuccess) {
         onPublishedSuccess(data.savedProducts);
       }
 
-      // Reset to a clean single slot
+      // Reset to one fresh empty item
       setItems([createEmptyItem(1)]);
       setExpandedIndex(0);
+      setUploadTasks({});
     } catch (err: any) {
       setNotice({
         type: 'error',
-        text: err.message || 'Serverfehler beim Veröffentlichen der Produkte.',
+        text: err.message || 'Serverfehler beim Veröffentlichen.',
       });
     } finally {
       setIsSubmitting(false);
@@ -372,264 +696,321 @@ export const BulkAddProductSection: React.FC<BulkAddProductSectionProps> = ({
   };
 
   return (
-    <div className="space-y-6">
-      {/* Clean Professional Header */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 flex flex-col md:flex-row md:items-center justify-between gap-5 shadow-sm">
-        <div className="space-y-1">
-          <div className="flex items-center gap-2 text-slate-400 text-xs font-medium">
-            <FlaskConical className="w-4 h-4 text-emerald-400" />
-            <span>Katalog-Management · Chemikalien-Stammdaten</span>
+    <div className="space-y-6 pb-28">
+      {/* Top Header Card */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl relative overflow-hidden">
+        <div className="absolute top-0 right-0 w-96 h-96 bg-emerald-500/5 rounded-full blur-3xl pointer-events-none" />
+
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-5 relative z-10">
+          <div>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
+                <FlaskConical className="w-5 h-5" />
+              </div>
+              <div>
+                <h2 className="text-xl font-bold text-white tracking-tight">
+                  Chemikalien Bulk-Erfassung & Katalog-Import
+                </h2>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Erfassen und synchronisieren Sie mehrere chemische Reagenzien zeitgleich mit direkter Cloudflare R2 Medien-Anbindung.
+                </p>
+              </div>
+            </div>
+
+            {/* Cloudflare R2 Storage Status Pill */}
+            <div className="flex flex-wrap items-center gap-3 mt-4 text-xs">
+              <div
+                className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border font-mono ${
+                  r2Info?.configured
+                    ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-300'
+                    : 'bg-amber-950/40 border-amber-800/60 text-amber-300'
+                }`}
+              >
+                <Cloud className={`w-3.5 h-3.5 ${r2Info?.configured ? 'text-emerald-400' : 'text-amber-400 animate-pulse'}`} />
+                <span className="font-sans font-semibold">Cloudflare R2 Storage:</span>
+                <span>
+                  {r2Info?.configured
+                    ? `Aktiv (${r2Info.bucket || 'aniixa-chemicals-storage'})`
+                    : 'Wird initialisiert...'}
+                </span>
+                {r2Info?.publicUrl && (
+                  <span className="text-slate-400 text-[11px] hidden sm:inline">
+                    · {r2Info.publicUrl}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={refreshR2Status}
+                  disabled={isCheckingR2}
+                  className="ml-1 p-0.5 text-slate-400 hover:text-white transition-colors"
+                  title="R2 Status prüfen"
+                >
+                  <RefreshCw className={`w-3 h-3 ${isCheckingR2 ? 'animate-spin' : ''}`} />
+                </button>
+              </div>
+
+              <div className="text-slate-400 text-xs flex items-center gap-2">
+                <span>Positionen:</span>
+                <span className="font-bold text-white font-mono bg-slate-800 px-2 py-0.5 rounded-md border border-slate-700">
+                  {items.length}
+                </span>
+              </div>
+            </div>
           </div>
-          <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
-            Bulk-Produkterfassung (Mehrere Chemikalien)
-          </h2>
-          <p className="text-xs text-slate-400 max-w-2xl leading-relaxed">
-            Erfassen Sie beliebig viele Chemikalien-Positionen in einem Durchgang. Alle Spezifikationen 
-            (Name, Summenformel, CAS-Nr., Reagenz-Kategorie, Qualitätsnorm, Aggregatzustand, Sicherheitsdaten und Mehrfach-Thumbnails) 
-            sind fest pro Position verknüpft und werden mit einem Klick publiziert.
-          </p>
-        </div>
 
-        {/* Global Action Buttons */}
-        <div className="flex flex-wrap items-center gap-3 shrink-0">
-          <button
-            type="button"
-            onClick={handleAddNewSlot}
-            className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700/80 text-emerald-400 hover:text-emerald-300 border border-slate-700 hover:border-emerald-500/40 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all cursor-pointer shadow-xs active:scale-[0.98]"
-          >
-            <Plus className="w-4 h-4" />
-            <span>Position hinzufügen</span>
-          </button>
-
-          <button
-            type="button"
-            disabled={isSubmitting}
-            onClick={handlePublishAll}
-            className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer shadow-md shadow-emerald-950/40 disabled:opacity-50 active:scale-[0.98]"
-          >
-            {isSubmitting ? (
-              <>
-                <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                <span>Wird gespeichert ({items.length})...</span>
-              </>
-            ) : (
-              <>
-                <Upload className="w-4 h-4" />
-                <span>Alle {items.length} Produkte veröffentlichen</span>
-              </>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {/* Notice Message */}
-      {notice && (
-        <div
-          className={`p-4 rounded-xl text-xs flex items-center gap-3 border shadow-sm transition-all ${
-            notice.type === 'success'
-              ? 'bg-emerald-950/40 border-emerald-800/80 text-emerald-200'
-              : 'bg-rose-950/40 border-rose-800/80 text-rose-200'
-          }`}
-        >
-          {notice.type === 'success' ? (
-            <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
-          ) : (
-            <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
-          )}
-          <span className="font-medium">{notice.text}</span>
-        </div>
-      )}
-
-      {/* Position Navigator (Clean Tab Strip) */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
-        <span className="text-xs font-medium text-slate-400 shrink-0 mr-1">
-          Positionen:
-        </span>
-        {items.map((item, idx) => {
-          const isCurrent = expandedIndex === idx;
-          const isFilled = Boolean(item.name.trim());
-          return (
+          {/* Action Buttons Header */}
+          <div className="flex items-center gap-3">
             <button
-              key={item.id}
-              onClick={() => setExpandedIndex(idx)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-2 transition-all cursor-pointer shrink-0 border ${
-                isCurrent
-                  ? 'bg-emerald-950/60 border-emerald-500 text-emerald-200 shadow-xs'
-                  : 'bg-slate-900 border-slate-800 text-slate-400 hover:bg-slate-850 hover:text-slate-200'
-              }`}
+              type="button"
+              onClick={handleAddNewSlot}
+              className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-xs font-semibold inline-flex items-center gap-2 border border-slate-700 hover:border-slate-600 transition-all cursor-pointer shadow-sm"
             >
-              <span className="text-[11px] font-mono text-slate-400 font-bold">
-                #{idx + 1}
-              </span>
-              <span className="truncate max-w-[140px]">
-                {item.name.trim() || `Position ${idx + 1}`}
-              </span>
-              {isFilled && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />}
+              <Plus className="w-4 h-4 text-emerald-400" />
+              <span>Position hinzufügen</span>
             </button>
-          );
-        })}
 
-        <button
-          onClick={handleAddNewSlot}
-          className="p-1.5 text-slate-400 hover:text-emerald-400 bg-slate-900 border border-dashed border-slate-700 hover:border-emerald-500/60 rounded-lg text-xs transition-colors shrink-0"
-          title="Neue Position anfügen"
-        >
-          <Plus className="w-3.5 h-3.5" />
-        </button>
+            <button
+              type="button"
+              onClick={handlePublishAll}
+              disabled={isSubmitting || hasActiveUploads}
+              className="px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold inline-flex items-center gap-2 shadow-lg shadow-emerald-950/50 transition-all cursor-pointer"
+            >
+              {isSubmitting ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>Wird veröffentlicht...</span>
+                </>
+              ) : hasActiveUploads ? (
+                <>
+                  <Cloud className="w-4 h-4 animate-pulse" />
+                  <span>R2-Upload läuft...</span>
+                </>
+              ) : (
+                <>
+                  <PackageCheck className="w-4 h-4" />
+                  <span>Alle {items.length} veröffentlichen</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {/* Status Notice Banner */}
+        {notice && (
+          <div
+            className={`mt-4 p-3.5 rounded-xl text-xs flex items-center justify-between gap-3 animate-in fade-in duration-200 ${
+              notice.type === 'success'
+                ? 'bg-emerald-950/80 border border-emerald-800 text-emerald-200'
+                : 'bg-rose-950/80 border border-rose-800 text-rose-200'
+            }`}
+          >
+            <div className="flex items-center gap-2.5">
+              {notice.type === 'success' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              ) : (
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+              )}
+              <span>{notice.text}</span>
+            </div>
+            <button
+              onClick={() => setNotice(null)}
+              className="text-slate-400 hover:text-white transition-colors"
+            >
+              ×
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Product Items List */}
+      {/* Chemical Product Items List */}
       <div className="space-y-4">
         {items.map((item, index) => {
           const isExpanded = expandedIndex === index;
-          const positionNumber = index + 1;
+          const currentUploads = uploadTasks[item.id] || { thumbnails: [], sds: null, video: null };
 
           return (
             <div
               key={item.id}
-              className={`border rounded-2xl transition-all duration-200 overflow-hidden ${
+              className={`bg-slate-900 border rounded-2xl transition-all overflow-hidden ${
                 isExpanded
-                  ? 'bg-slate-950 border-slate-700 shadow-lg'
-                  : 'bg-slate-950/70 border-slate-800 hover:border-slate-700'
+                  ? 'border-emerald-500/50 shadow-xl shadow-emerald-950/20'
+                  : 'border-slate-800 hover:border-slate-700 shadow-md'
               }`}
             >
-              {/* Header Bar */}
+              {/* Product Header Row */}
               <div
                 onClick={() => setExpandedIndex(isExpanded ? null : index)}
-                className="p-4 sm:px-6 flex items-center justify-between gap-3 cursor-pointer select-none bg-slate-900/60 hover:bg-slate-900 transition-colors"
+                className="p-4 sm:p-5 flex items-center justify-between gap-4 cursor-pointer select-none bg-slate-900/90 hover:bg-slate-850 transition-colors"
               >
                 <div className="flex items-center gap-3.5 min-w-0">
-                  <div className="w-7 h-7 rounded-lg bg-slate-800 text-slate-300 font-mono font-bold text-xs flex items-center justify-center shrink-0 border border-slate-700">
-                    {positionNumber}
+                  <div className="w-8 h-8 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center font-mono text-xs font-bold text-slate-300 shrink-0">
+                    {index + 1}
                   </div>
+
                   <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <h3 className="font-semibold text-white text-sm sm:text-base truncate">
-                        {item.name.trim() || `Chemikalien-Position ${positionNumber}`}
-                      </h3>
+                    <div className="flex items-center gap-2.5">
+                      <h4 className="text-sm font-bold text-white truncate">
+                        {item.name || (
+                          <span className="text-slate-500 italic">
+                            Chemikalien-Name eingeben...
+                          </span>
+                        )}
+                      </h4>
                       {item.formula && (
-                        <span className="font-mono text-xs text-emerald-400 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-800/40">
-                          {item.formula}
+                        <span className="font-mono text-xs text-emerald-400/90 font-medium hidden sm:inline">
+                          [{item.formula}]
                         </span>
                       )}
                     </div>
-                    <div className="text-xs text-slate-400 flex items-center gap-2 mt-0.5 font-normal">
-                      <span>CAS: {item.casNumber || '–'}</span>
-                      <span>·</span>
+                    <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5">
                       <span>{item.category}</span>
                       <span>·</span>
                       <span>{item.grade}</span>
                       <span>·</span>
-                      <span>{item.physicalState}</span>
-                      <span>·</span>
-                      <span className="text-emerald-400 font-mono font-medium">${item.price}</span>
+                      <span>{item.purity}</span>
+                      {item.casNumber && (
+                        <>
+                          <span>·</span>
+                          <span className="font-mono">CAS {item.casNumber}</span>
+                        </>
+                      )}
+                      {item.thumbnails.length > 0 && (
+                        <>
+                          <span>·</span>
+                          <span className="text-emerald-400 font-medium">
+                            {item.thumbnails.length} Bild{item.thumbnails.length > 1 ? 'er' : ''} (R2)
+                          </span>
+                        </>
+                      )}
+                      {item.sdsDocumentName && (
+                        <>
+                          <span>·</span>
+                          <span className="text-rose-400 font-medium">SDS PDF (R2)</span>
+                        </>
+                      )}
+                      {item.demoVideoUrl && (
+                        <>
+                          <span>·</span>
+                          <span className="text-cyan-400 font-medium">Video (R2)</span>
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>
 
-                {/* Right Controls */}
-                <div className="flex items-center gap-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                {/* Right controls: Duplicate, Delete, Expand/Collapse */}
+                <div className="flex items-center gap-2 shrink-0">
                   <button
                     type="button"
-                    onClick={() => handleDuplicateSlot(index)}
-                    className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors cursor-pointer"
-                    title="Diese Position duplizieren"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleDuplicateSlot(index);
+                    }}
+                    className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
+                    title="Position duplizieren"
                   >
                     <Copy className="w-4 h-4" />
                   </button>
 
                   <button
                     type="button"
-                    onClick={() => handleRemoveSlot(index)}
-                    className="p-2 text-slate-400 hover:text-rose-400 hover:bg-rose-950/40 rounded-lg transition-colors cursor-pointer"
-                    title="Diese Position löschen"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleRemoveSlot(index);
+                    }}
+                    className="p-2 text-slate-400 hover:text-rose-400 hover:bg-rose-950/40 rounded-lg transition-colors"
+                    title="Position löschen"
                   >
                     <Trash2 className="w-4 h-4" />
                   </button>
 
-                  <button
-                    type="button"
-                    onClick={() => setExpandedIndex(isExpanded ? null : index)}
-                    className="p-2 text-slate-400 hover:text-white rounded-lg transition-colors"
-                  >
-                    {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                  </button>
+                  <div className="w-8 h-8 rounded-lg bg-slate-800/80 flex items-center justify-center text-slate-400 ml-1">
+                    {isExpanded ? (
+                      <ChevronUp className="w-4 h-4 text-emerald-400" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4" />
+                    )}
+                  </div>
                 </div>
               </div>
 
-              {/* Form Body */}
+              {/* Collapsible Form Body */}
               {isExpanded && (
-                <div className="p-5 sm:p-6 space-y-6 border-t border-slate-800">
-                  {/* SECTION 1: Chemical Identification & Purity */}
-                  <div className="space-y-3">
-                    <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2">
-                      <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>1. Primäre Identifikation & Reinheit</span>
-                    </h4>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-                      {/* Chemical Name */}
-                      <div className="sm:col-span-2">
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          Chemikalien-Name <span className="text-rose-400">*</span>
+                <div className="p-5 sm:p-6 border-t border-slate-800/80 space-y-6 bg-slate-950/40">
+                  {/* SECTION 1: Primary Chemical Identification */}
+                  <div>
+                    <h5 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-3">
+                      1. Chemische Identifikation
+                    </h5>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                          Chemikalien-Name *
                         </label>
                         <input
                           type="text"
-                          required
                           value={item.name}
                           onChange={(e) => updateItemField(index, 'name', e.target.value)}
-                          placeholder="z.B. Ethanol absolut ≥ 99.8%"
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white placeholder-slate-500 transition-colors focus:outline-hidden"
+                          placeholder="z.B. Ethanol absolut, Aceton..."
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-hidden transition-colors"
                         />
                       </div>
 
-                      {/* Formula */}
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          Summenformel
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                          Summenformel (Formula)
                         </label>
                         <input
                           type="text"
                           value={item.formula}
                           onChange={(e) => updateItemField(index, 'formula', e.target.value)}
-                          placeholder="z.B. C₂H₅OH"
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white font-mono placeholder-slate-500 transition-colors focus:outline-hidden"
+                          placeholder="z.B. C2H5OH, CH3COCH3..."
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs font-mono text-emerald-300 placeholder-slate-500 focus:outline-hidden transition-colors"
                         />
                       </div>
 
-                      {/* CAS Registry ID */}
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          CAS Registry ID No.
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                          CAS Registry Nummer
                         </label>
                         <input
                           type="text"
                           value={item.casNumber}
                           onChange={(e) => updateItemField(index, 'casNumber', e.target.value)}
                           placeholder="z.B. 64-17-5"
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white font-mono placeholder-slate-500 transition-colors focus:outline-hidden"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs font-mono text-white placeholder-slate-500 focus:outline-hidden transition-colors"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                          Substanz-Reinheit (Purity)
+                        </label>
+                        <input
+                          type="text"
+                          value={item.purity}
+                          onChange={(e) => updateItemField(index, 'purity', e.target.value)}
+                          placeholder="z.B. ≥ 99.8%, 99.5%..."
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-hidden transition-colors"
                         />
                       </div>
                     </div>
                   </div>
 
-                  {/* SECTION 2: Category, Quality Grade & Physical State */}
-                  <div className="space-y-3">
-                    <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2">
-                      <FlaskConical className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>2. Spezifikation & Klassifizierung</span>
-                    </h4>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-                      {/* Reagent Category */}
+                  {/* SECTION 2: Quality & Classification Dropdowns */}
+                  <div>
+                    <h5 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-3">
+                      2. Klassifizierung & Qualitätsnorm
+                    </h5>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          Reagenz-Kategorie
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                          Reagenz-Kategorie (Reagent Category)
                         </label>
                         <select
                           value={item.category}
                           onChange={(e) => updateItemField(index, 'category', e.target.value as ReagentCategoryType)}
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white transition-colors focus:outline-hidden cursor-pointer"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs text-white focus:outline-hidden transition-colors cursor-pointer"
                         >
                           {REAGENT_CATEGORIES.map((cat) => (
                             <option key={cat} value={cat}>
@@ -639,51 +1020,35 @@ export const BulkAddProductSection: React.FC<BulkAddProductSectionProps> = ({
                         </select>
                       </div>
 
-                      {/* Substance Purity */}
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          Reinheitsgrad
-                        </label>
-                        <input
-                          type="text"
-                          value={item.purity}
-                          onChange={(e) => updateItemField(index, 'purity', e.target.value)}
-                          placeholder="z.B. ≥ 99.8% (GC)"
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white placeholder-slate-500 transition-colors focus:outline-hidden"
-                        />
-                      </div>
-
-                      {/* Market Grade */}
-                      <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          Qualitätsnorm (Market Grade)
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                          Markt-Qualitätsgrad (Market Grade)
                         </label>
                         <select
                           value={item.grade}
                           onChange={(e) => updateItemField(index, 'grade', e.target.value as MarketGradeType)}
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white transition-colors focus:outline-hidden cursor-pointer"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs text-white focus:outline-hidden transition-colors cursor-pointer"
                         >
-                          {MARKET_GRADES.map((grd) => (
-                            <option key={grd} value={grd}>
-                              {grd}
+                          {MARKET_GRADES.map((gr) => (
+                            <option key={gr} value={gr}>
+                              {gr}
                             </option>
                           ))}
                         </select>
                       </div>
 
-                      {/* Physical State */}
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          Aggregatzustand
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                          Aggregatzustand (Physical State)
                         </label>
                         <select
                           value={item.physicalState}
                           onChange={(e) => updateItemField(index, 'physicalState', e.target.value as PhysicalStateType)}
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white transition-colors focus:outline-hidden cursor-pointer"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs text-white focus:outline-hidden transition-colors cursor-pointer"
                         >
-                          {PHYSICAL_STATES.map((state) => (
-                            <option key={state} value={state}>
-                              {state}
+                          {PHYSICAL_STATES.map((st) => (
+                            <option key={st} value={st}>
+                              {st}
                             </option>
                           ))}
                         </select>
@@ -691,84 +1056,77 @@ export const BulkAddProductSection: React.FC<BulkAddProductSectionProps> = ({
                     </div>
                   </div>
 
-                  {/* SECTION 3: Pricing, Packaging & Stock Units */}
-                  <div className="space-y-3">
-                    <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2">
-                      <PackageCheck className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>3. Kommerzielle Angaben & Lagerbestand</span>
-                    </h4>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                      {/* Sales Price (USD $) */}
+                  {/* SECTION 3: Commercial & Inventory Parameters */}
+                  <div>
+                    <h5 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-3">
+                      3. Kommerzielle Konditionen & Lagerbestand
+                    </h5>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
                           Verkaufspreis (USD $)
                         </label>
                         <div className="relative">
-                          <span className="absolute left-3.5 top-2 text-xs font-mono text-emerald-400 font-bold">$</span>
+                          <span className="absolute left-3 top-2 text-xs text-slate-500">$</span>
                           <input
                             type="text"
                             value={item.price}
                             onChange={(e) => updateItemField(index, 'price', e.target.value)}
                             placeholder="28.50"
-                            className="w-full pl-8 pr-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white font-mono placeholder-slate-500 transition-colors focus:outline-hidden"
+                            className="w-full pl-7 pr-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs font-mono text-white placeholder-slate-500 focus:outline-hidden transition-colors"
                           />
                         </div>
                       </div>
 
-                      {/* Packaging Unit */}
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          Gebindegröße & Verpackung
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                          Gebinde & Verpackungseinheit
                         </label>
                         <input
                           type="text"
                           value={item.unit}
                           onChange={(e) => updateItemField(index, 'unit', e.target.value)}
                           placeholder="z.B. 1.000 ml Glasflasche DIN GL45"
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white placeholder-slate-500 transition-colors focus:outline-hidden"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-hidden transition-colors"
                         />
                       </div>
 
-                      {/* Stock Units */}
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          Verfügbare Lagereinheiten
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                          Verfügbarer Lagerbestand (Einheiten)
                         </label>
                         <input
                           type="number"
                           min="0"
                           value={item.stockUnits}
-                          onChange={(e) => updateItemField(index, 'stockUnits', parseInt(e.target.value, 10) || 0)}
-                          placeholder="50"
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white font-mono placeholder-slate-500 transition-colors focus:outline-hidden"
+                          onChange={(e) => updateItemField(index, 'stockUnits', parseInt(e.target.value) || 0)}
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs font-mono text-white focus:outline-hidden transition-colors"
                         />
                       </div>
                     </div>
                   </div>
 
-                  {/* SECTION 4: Molecular & Physical Constants */}
-                  <div className="space-y-3">
-                    <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2">
-                      <span>4. Physikalische & Chemische Konstanten</span>
-                    </h4>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  {/* SECTION 4: Physical & Chemical Constants */}
+                  <div>
+                    <h5 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-3">
+                      4. Physikochemische Konstanten
+                    </h5>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          Molekulargewicht (Molar Mass)
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                          Molare Masse (Molecular Weight)
                         </label>
                         <input
                           type="text"
                           value={item.molecularWeight}
                           onChange={(e) => updateItemField(index, 'molecularWeight', e.target.value)}
                           placeholder="z.B. 46.07 g/mol"
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white font-mono placeholder-slate-500 transition-colors focus:outline-hidden"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs font-mono text-white placeholder-slate-500 focus:outline-hidden transition-colors"
                         />
                       </div>
 
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
                           Schmelzpunkt (°C)
                         </label>
                         <input
@@ -776,12 +1134,12 @@ export const BulkAddProductSection: React.FC<BulkAddProductSectionProps> = ({
                           value={item.meltingPoint}
                           onChange={(e) => updateItemField(index, 'meltingPoint', e.target.value)}
                           placeholder="z.B. -114.1 °C"
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white font-mono placeholder-slate-500 transition-colors focus:outline-hidden"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs font-mono text-white placeholder-slate-500 focus:outline-hidden transition-colors"
                         />
                       </div>
 
                       <div>
-                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">
                           Siedepunkt (°C)
                         </label>
                         <input
@@ -789,330 +1147,507 @@ export const BulkAddProductSection: React.FC<BulkAddProductSectionProps> = ({
                           value={item.boilingPoint}
                           onChange={(e) => updateItemField(index, 'boilingPoint', e.target.value)}
                           placeholder="z.B. 78.37 °C"
-                          className="w-full px-3.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white font-mono placeholder-slate-500 transition-colors focus:outline-hidden"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs font-mono text-white placeholder-slate-500 focus:outline-hidden transition-colors"
                         />
                       </div>
                     </div>
                   </div>
 
-                  {/* SECTION 5: Description */}
-                  <div className="space-y-1.5">
-                    <label className="block text-xs font-medium text-slate-300">
-                      Spezifikation & Produktbeschreibung
-                    </label>
+                  {/* SECTION 5: Description & Application */}
+                  <div>
+                    <h5 className="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">
+                      5. Produktbeschreibung & Verwendungszweck
+                    </h5>
                     <textarea
                       rows={2}
                       value={item.description}
                       onChange={(e) => updateItemField(index, 'description', e.target.value)}
-                      placeholder="Detaillierte Beschreibung der Chemikalie, Reinheitsnachweis, Syntheseanwendungen, Qualitätsgarantien..."
-                      className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 hover:border-slate-700 focus:border-emerald-500 rounded-xl text-xs text-white placeholder-slate-500 transition-colors focus:outline-hidden"
+                      placeholder="Detaillierte Qualitätsbeschreibung, Reinheitszertifikat, Labor- & Industrieanwendungen..."
+                      className="w-full px-3 py-2 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-hidden transition-colors resize-y"
                     />
                   </div>
 
-                  {/* SECTION 6: Multi-Thumbnail Upload */}
-                  <div className="p-4 bg-slate-900/60 rounded-xl border border-slate-800/80 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <ImageIcon className="w-4 h-4 text-emerald-400" />
-                        <h5 className="text-xs font-semibold text-white">
-                          Produkt-Thumbnails (Mehrfachauswahl)
-                        </h5>
+                  {/* ======================================================== */}
+                  {/* SECTION 6: CLOUDFLARE R2 PRODUCTION MEDIA UPLOADS        */}
+                  {/* ======================================================== */}
+                  <div className="p-4 bg-slate-900/80 rounded-2xl border border-slate-800 space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800/80 pb-3">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <Cloud className="w-4 h-4 text-emerald-400" />
+                          <h5 className="text-xs font-bold text-white uppercase tracking-wider">
+                            6. Cloudflare R2 Medien-Upload (Production Ready)
+                          </h5>
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                          Alle Dateien werden direkt im Bucket <span className="font-mono text-emerald-300">aniixa-chemicals-storage</span> gespeichert.
+                        </p>
                       </div>
-                      <span className="text-[11px] text-slate-400">
-                        {item.thumbnails.length} Bilder hinterlegt · Stern anklicken für Hauptbild
-                      </span>
+
+                      <div className="text-[11px] font-mono text-slate-400 flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                        <span>R2 Direktanbindung aktiv</span>
+                      </div>
                     </div>
 
-                    {/* Thumbnail Grid */}
-                    <div className="flex flex-wrap items-center gap-3">
-                      {item.thumbnails
-                        .filter((thumbUrl) => Boolean(thumbUrl && typeof thumbUrl === 'string' && thumbUrl.trim()))
-                        .map((thumbUrl, tIdx) => {
-                          const isPrimary = item.primaryThumbnailIndex === tIdx;
+                    {/* A. PRODUCT THUMBNAILS (MULTI-IMAGE WITH PROGRESS BARS) */}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <ImageIcon className="w-4 h-4 text-emerald-400" />
+                          <span className="text-xs font-semibold text-white">
+                            Produkt-Thumbnails ({item.thumbnails.length} gespeichert)
+                          </span>
+                        </div>
+                        <span className="text-[11px] text-slate-400">
+                          Mehrere Bilder wählbar · Stern = Primärbild
+                        </span>
+                      </div>
+
+                      {/* Active Thumbnail Upload Progress Bars */}
+                      {currentUploads.thumbnails.length > 0 && (
+                        <div className="space-y-2">
+                          {currentUploads.thumbnails.map((task) => (
+                            <R2UploadProgressBar
+                              key={task.id}
+                              fileName={task.name}
+                              fileType="image"
+                              progress={task.progress}
+                              status={task.status}
+                              errorMessage={task.errorMessage}
+                              onCancel={task.cancel}
+                              bucketName={r2Info?.bucket || 'aniixa-chemicals-storage'}
+                            />
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Thumbnails Gallery & Upload Box */}
+                      <div className="flex flex-wrap items-center gap-3">
+                        {item.thumbnails.map((thumbUrl, tIdx) => {
+                          const isPrimary = tIdx === item.primaryThumbnailIndex;
                           return (
                             <div
                               key={tIdx}
                               onClick={() => updateItemField(index, 'primaryThumbnailIndex', tIdx)}
-                              className={`relative w-20 h-20 rounded-xl overflow-hidden border-2 cursor-pointer transition-all ${
+                              className={`relative w-24 h-24 rounded-xl overflow-hidden border-2 cursor-pointer group bg-slate-950 transition-all ${
                                 isPrimary
-                                  ? 'border-emerald-500 shadow-md ring-2 ring-emerald-500/20'
+                                  ? 'border-emerald-500 shadow-lg shadow-emerald-950/50 ring-2 ring-emerald-500/30'
                                   : 'border-slate-800 hover:border-slate-600'
                               }`}
                             >
                               <img
                                 src={thumbUrl}
-                                alt={`Vorschau ${tIdx}`}
+                                alt={`Thumbnail ${tIdx + 1}`}
                                 className="w-full h-full object-cover"
-                                onError={(e) => {
-                                  e.currentTarget.style.display = 'none';
-                                }}
                               />
+
+                              {/* Cloudflare R2 indicator pill */}
+                              <div className="absolute bottom-1 left-1 px-1.5 py-0.5 rounded bg-slate-950/80 text-[9px] font-mono text-emerald-300 border border-emerald-900/60 flex items-center gap-1">
+                                <Cloud className="w-2.5 h-2.5" />
+                                <span>R2</span>
+                              </div>
+
+                              {/* Primary badge */}
                               {isPrimary && (
                                 <div
                                   className="absolute top-1 left-1 bg-emerald-600 text-white p-1 rounded-md shadow-xs"
-                                  title="Primäres Produktbild"
+                                  title="Primäres Katalogbild"
                                 >
                                   <Star className="w-3 h-3 fill-white" />
                                 </div>
                               )}
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const filtered = item.thumbnails.filter((_, i) => i !== tIdx);
-                                  updateItemField(index, 'thumbnails', filtered);
-                                  if (item.primaryThumbnailIndex >= filtered.length) {
-                                    updateItemField(index, 'primaryThumbnailIndex', 0);
-                                  }
-                                }}
-                                className="absolute top-1 right-1 bg-slate-950/80 hover:bg-rose-900 text-white p-1 rounded-md transition-colors"
-                                title="Bild entfernen"
-                              >
-                                <Trash2 className="w-3 h-3" />
-                              </button>
+
+                              {/* Top Right Action: View & Delete */}
+                              <div className="absolute top-1 right-1 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <a
+                                  href={thumbUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="bg-slate-950/80 hover:bg-slate-800 text-white p-1 rounded-md transition-colors"
+                                  title="In neuem Tab ansehen"
+                                >
+                                  <Eye className="w-3 h-3" />
+                                </a>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const filtered = item.thumbnails.filter((_, i) => i !== tIdx);
+                                    updateItemField(index, 'thumbnails', filtered);
+                                    if (item.primaryThumbnailIndex >= filtered.length) {
+                                      updateItemField(index, 'primaryThumbnailIndex', 0);
+                                    }
+                                  }}
+                                  className="bg-slate-950/80 hover:bg-rose-900 text-white p-1 rounded-md transition-colors"
+                                  title="Bild entfernen"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              </div>
                             </div>
                           );
                         })}
 
-                      {/* Upload Button */}
-                      <label className="w-20 h-20 rounded-xl border-2 border-dashed border-slate-700 hover:border-emerald-500/60 bg-slate-900/80 flex flex-col items-center justify-center gap-1 cursor-pointer transition-colors text-slate-400 hover:text-emerald-400">
-                        <Upload className="w-4 h-4" />
-                        <span className="text-[10px] font-medium">Upload</span>
-                        <input
-                          type="file"
-                          multiple
-                          accept="image/*"
-                          onChange={(e) => handleThumbnailUpload(index, e)}
-                          className="hidden"
-                        />
-                      </label>
-                    </div>
-                  </div>
-
-                  {/* SECTION 7: SDS PDF & Demonstration Video */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {/* SDS Document */}
-                    <div className="p-4 bg-slate-900/60 rounded-xl border border-slate-800/80 space-y-2">
-                      <div className="flex items-center gap-2 text-xs font-semibold text-white">
-                        <FileText className="w-4 h-4 text-emerald-400" />
-                        <span>Sicherheitsdatenblatt (SDS / REACH PDF)</span>
-                      </div>
-                      <p className="text-[11px] text-slate-400">
-                        Laden Sie das offizielle REACH / GHS Sicherheitsdatenblatt als PDF hoch.
-                      </p>
-                      <div className="flex items-center gap-3 pt-1">
-                        <label className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs border border-slate-700 hover:border-slate-600 transition-colors cursor-pointer inline-flex items-center gap-2">
-                          <Upload className="w-3.5 h-3.5 text-emerald-400" />
-                          <span>PDF auswählen</span>
+                        {/* Upload Button Dropzone */}
+                        <label className="w-24 h-24 rounded-xl border-2 border-dashed border-slate-700 hover:border-emerald-500 bg-slate-900/60 hover:bg-slate-900 flex flex-col items-center justify-center gap-1.5 cursor-pointer transition-all text-slate-400 hover:text-emerald-400 group">
+                          <Upload className="w-5 h-5 group-hover:scale-110 transition-transform" />
+                          <span className="text-[10px] font-semibold">Bilder hochladen</span>
+                          <span className="text-[9px] text-slate-500">JPG, PNG, WebP</span>
                           <input
                             type="file"
-                            accept=".pdf,application/pdf"
-                            onChange={(e) => handleSdsUpload(index, e)}
+                            multiple
+                            accept="image/*"
+                            onChange={(e) => handleThumbnailUpload(index, e)}
                             className="hidden"
                           />
                         </label>
-                        {item.sdsDocumentName && (
-                          <span className="text-xs font-mono text-emerald-400 truncate max-w-[200px] flex items-center gap-1">
-                            <Check className="w-3.5 h-3.5" />
-                            <span>{item.sdsDocumentName}</span>
-                          </span>
+                      </div>
+                    </div>
+
+                    {/* B. SDS PDF DOCUMENT & DEMONSTRATION VIDEO GRID */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+                      {/* B1. SDS DOCUMENT (PDF) */}
+                      <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                            <FileText className="w-4 h-4 text-rose-400" />
+                            <span>Sicherheitsdatenblatt (SDS / REACH PDF)</span>
+                          </div>
+                          <span className="text-[10px] font-mono text-slate-500">PDF bis 50 MB</span>
+                        </div>
+
+                        {/* SDS Uploading Progress Bar */}
+                        {currentUploads.sds && (
+                          <R2UploadProgressBar
+                            fileName={currentUploads.sds.name}
+                            fileType="pdf"
+                            progress={currentUploads.sds.progress}
+                            status={currentUploads.sds.status}
+                            errorMessage={currentUploads.sds.errorMessage}
+                            onCancel={currentUploads.sds.cancel}
+                            bucketName={r2Info?.bucket || 'aniixa-chemicals-storage'}
+                          />
+                        )}
+
+                        {/* SDS Document Uploaded Card */}
+                        {item.sdsDocumentUrl ? (
+                          <div className="p-3 bg-slate-900 rounded-xl border border-emerald-900/50 space-y-2">
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <div className="w-8 h-8 rounded-lg bg-rose-950/80 border border-rose-800 flex items-center justify-center shrink-0">
+                                  <FileText className="w-4 h-4 text-rose-400" />
+                                </div>
+                                <div className="min-w-0">
+                                  <div className="text-xs font-bold text-white truncate max-w-[200px]" title={item.sdsDocumentName || 'Sicherheitsdatenblatt.pdf'}>
+                                    {item.sdsDocumentName || 'Sicherheitsdatenblatt.pdf'}
+                                  </div>
+                                  <div className="text-[10px] text-emerald-400 font-mono flex items-center gap-1">
+                                    <Cloud className="w-2.5 h-2.5" />
+                                    <span>In Cloudflare R2 gesichert</span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  updateItemField(index, 'sdsDocumentUrl', '');
+                                  updateItemField(index, 'sdsDocumentName', '');
+                                }}
+                                className="p-1 text-slate-400 hover:text-rose-400 transition-colors"
+                                title="SDS Dokument entfernen"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+
+                            <div className="flex items-center gap-2 pt-1">
+                              <a
+                                href={item.sdsDocumentUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 transition-colors border border-slate-700"
+                              >
+                                <ExternalLink className="w-3 h-3 text-emerald-400" />
+                                <span>PDF im Browser öffnen</span>
+                              </a>
+
+                              <label className="px-3 py-1.5 bg-slate-800/60 hover:bg-slate-800 text-slate-400 hover:text-white rounded-lg text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer border border-slate-700/60">
+                                <Upload className="w-3 h-3" />
+                                <span>Ersetzen</span>
+                                <input
+                                  type="file"
+                                  accept=".pdf,application/pdf"
+                                  onChange={(e) => handleSdsUpload(index, e)}
+                                  className="hidden"
+                                />
+                              </label>
+                            </div>
+                          </div>
+                        ) : (
+                          /* Empty SDS Dropzone */
+                          <label className="p-4 rounded-xl border-2 border-dashed border-slate-800 hover:border-emerald-500 bg-slate-900/40 hover:bg-slate-900 flex flex-col items-center justify-center gap-1.5 cursor-pointer transition-colors text-slate-400 hover:text-emerald-400 group">
+                            <Upload className="w-5 h-5 text-emerald-400/80 group-hover:scale-110 transition-transform" />
+                            <span className="text-xs font-semibold text-white">
+                              REACH / GHS Sicherheitsdatenblatt hochladen
+                            </span>
+                            <span className="text-[10px] text-slate-500">
+                              PDF anklicken oder ablegen · Direkte Cloudflare R2 Archivierung
+                            </span>
+                            <input
+                              type="file"
+                              accept=".pdf,application/pdf"
+                              onChange={(e) => handleSdsUpload(index, e)}
+                              className="hidden"
+                            />
+                          </label>
+                        )}
+                      </div>
+
+                      {/* B2. DEMONSTRATION VIDEO */}
+                      <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                            <Video className="w-4 h-4 text-cyan-400" />
+                            <span>Demonstrations-Video</span>
+                          </div>
+                          <span className="text-[10px] font-mono text-slate-500">MP4, WebM bis 200 MB</span>
+                        </div>
+
+                        {/* Video Uploading Progress Bar */}
+                        {currentUploads.video && (
+                          <R2UploadProgressBar
+                            fileName={currentUploads.video.name}
+                            fileType="video"
+                            progress={currentUploads.video.progress}
+                            status={currentUploads.video.status}
+                            errorMessage={currentUploads.video.errorMessage}
+                            onCancel={currentUploads.video.cancel}
+                            bucketName={r2Info?.bucket || 'aniixa-chemicals-storage'}
+                          />
+                        )}
+
+                        {/* Video Uploaded Card with HTML5 player */}
+                        {item.demoVideoUrl ? (
+                          <div className="p-3 bg-slate-900 rounded-xl border border-cyan-950 space-y-2.5">
+                            {/* Live video player preview */}
+                            <div className="rounded-lg overflow-hidden bg-black border border-slate-800 aspect-video max-h-44 flex items-center justify-center">
+                              <video
+                                src={item.demoVideoUrl}
+                                controls
+                                className="w-full h-full object-contain"
+                              />
+                            </div>
+
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="text-emerald-400 font-mono text-[10px] flex items-center gap-1">
+                                <Cloud className="w-3 h-3" />
+                                <span>Cloudflare R2 Video-Stream aktiv</span>
+                              </span>
+
+                              <div className="flex items-center gap-2">
+                                <label className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-[11px] font-medium cursor-pointer inline-flex items-center gap-1 transition-colors border border-slate-700">
+                                  <Upload className="w-3 h-3 text-cyan-400" />
+                                  <span>Ersetzen</span>
+                                  <input
+                                    type="file"
+                                    accept="video/*"
+                                    onChange={(e) => handleVideoUpload(index, e)}
+                                    className="hidden"
+                                  />
+                                </label>
+
+                                <button
+                                  type="button"
+                                  onClick={() => updateItemField(index, 'demoVideoUrl', '')}
+                                  className="p-1 text-slate-400 hover:text-rose-400 transition-colors"
+                                  title="Video entfernen"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        ) : (
+                          /* Empty Video Dropzone */
+                          <div className="space-y-2">
+                            <label className="p-4 rounded-xl border-2 border-dashed border-slate-800 hover:border-cyan-500 bg-slate-900/40 hover:bg-slate-900 flex flex-col items-center justify-center gap-1.5 cursor-pointer transition-colors text-slate-400 hover:text-cyan-400 group">
+                              <Film className="w-5 h-5 text-cyan-400/80 group-hover:scale-110 transition-transform" />
+                              <span className="text-xs font-semibold text-white">
+                                Produkt-Demonstrations-Video hochladen
+                              </span>
+                              <span className="text-[10px] text-slate-500">
+                                MP4, WebM, MOV · Direktes Cloudflare R2 Streaming
+                              </span>
+                              <input
+                                type="file"
+                                accept="video/*"
+                                onChange={(e) => handleVideoUpload(index, e)}
+                                className="hidden"
+                              />
+                            </label>
+
+                            {/* Or direct video URL */}
+                            <div className="relative">
+                              <input
+                                type="url"
+                                value={item.demoVideoUrl}
+                                onChange={(e) => updateItemField(index, 'demoVideoUrl', e.target.value)}
+                                placeholder="Oder externe Video-URL eingeben..."
+                                className="w-full px-3 py-1.5 bg-slate-900 border border-slate-800 focus:border-cyan-500 rounded-lg text-xs text-white placeholder-slate-500 focus:outline-hidden"
+                              />
+                            </div>
+                          </div>
                         )}
                       </div>
                     </div>
-
-                    {/* Demonstration Video */}
-                    <div className="p-4 bg-slate-900/60 rounded-xl border border-slate-800/80 space-y-2">
-                      <div className="flex items-center gap-2 text-xs font-semibold text-white">
-                        <Video className="w-4 h-4 text-emerald-400" />
-                        <span>Demonstrations-Video</span>
-                      </div>
-                      <p className="text-[11px] text-slate-400">
-                        Laden Sie ein Produktvideo (MP4/WebM) hoch oder hinterlegen Sie eine Video-URL.
-                      </p>
-                      <div className="flex items-center gap-2 pt-1">
-                        <label className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs border border-slate-700 hover:border-slate-600 transition-colors cursor-pointer inline-flex items-center gap-1.5 shrink-0">
-                          <Upload className="w-3.5 h-3.5 text-emerald-400" />
-                          <span>Video-Datei</span>
-                          <input
-                            type="file"
-                            accept="video/*"
-                            onChange={(e) => handleVideoUpload(index, e)}
-                            className="hidden"
-                          />
-                        </label>
-                        <input
-                          type="url"
-                          value={item.demoVideoUrl?.startsWith('data:') ? 'Video-Datei hochgeladen' : item.demoVideoUrl}
-                          onChange={(e) => updateItemField(index, 'demoVideoUrl', e.target.value)}
-                          placeholder="Oder Video-URL einfügen"
-                          className="w-full px-3 py-1.5 bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-lg text-xs text-white placeholder-slate-500 focus:outline-hidden"
-                        />
-                      </div>
-                    </div>
                   </div>
 
-                  {/* SECTION 8: NFPA 704 Safety Diamond Parameters */}
+                  {/* SECTION 7: NFPA 704 Safety Diamond Parameters */}
                   <div className="p-4 bg-slate-900/60 rounded-xl border border-slate-800/80 space-y-3">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
                         <Flame className="w-4 h-4 text-amber-400" />
                         <h5 className="text-xs font-semibold text-white">
-                          NFPA 704 Sicherheitsdiamant (0-4)
+                          7. NFPA 704 Sicherheitsdiamant (0-4)
                         </h5>
                       </div>
-                      <span className="text-[11px] text-slate-400">
-                        Standardisierte Gefahreneinstufung nach Brandschutz- und Chemikaliensicherheit
+                      <span className="text-[11px] text-slate-400 font-mono">
+                        H:{item.nfpaHealth} · F:{item.nfpaFlammability} · I:{item.nfpaInstability} {item.nfpaSpecial ? `· ${item.nfpaSpecial}` : ''}
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                      {/* Health (Blue) */}
-                      <div className="p-3 bg-blue-950/20 border border-blue-900/40 rounded-xl space-y-1.5">
-                        <label className="block text-[11px] font-semibold text-blue-300">
-                          Gesundheit (Blau 0-4)
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      {/* Health - Blue */}
+                      <div className="p-2.5 rounded-lg bg-blue-950/30 border border-blue-900/40">
+                        <label className="block text-[10px] font-bold text-blue-400 mb-1">
+                          Gesundheit (Blau: 0-4)
                         </label>
                         <select
                           value={item.nfpaHealth}
-                          onChange={(e) => updateItemField(index, 'nfpaHealth', parseInt(e.target.value, 10))}
-                          className="w-full px-2.5 py-1.5 bg-slate-900 border border-blue-900/50 rounded-lg text-white font-mono text-xs focus:outline-hidden cursor-pointer"
+                          onChange={(e) => updateItemField(index, 'nfpaHealth', parseInt(e.target.value) || 0)}
+                          className="w-full px-2 py-1 bg-slate-900 border border-blue-900/60 rounded text-xs font-mono text-white"
                         >
-                          <option value="0">0 - Normales Material</option>
-                          <option value="1">1 - Geringe Gefahr</option>
-                          <option value="2">2 - Mäßige Gefahr</option>
-                          <option value="3">3 - Schwere Gefahr</option>
-                          <option value="4">4 - Tödliche Gefahr</option>
+                          {[0, 1, 2, 3, 4].map((v) => (
+                            <option key={v} value={v}>
+                              {v} - {v === 0 ? 'Keine Gefahr' : v === 4 ? 'Tödlich' : `Gefahrstufe ${v}`}
+                            </option>
+                          ))}
                         </select>
                       </div>
 
-                      {/* Flammability (Red) */}
-                      <div className="p-3 bg-rose-950/20 border border-rose-900/40 rounded-xl space-y-1.5">
-                        <label className="block text-[11px] font-semibold text-rose-300">
-                          Entflammbarkeit (Rot 0-4)
+                      {/* Flammability - Red */}
+                      <div className="p-2.5 rounded-lg bg-rose-950/30 border border-rose-900/40">
+                        <label className="block text-[10px] font-bold text-rose-400 mb-1">
+                          Entflammbarkeit (Rot: 0-4)
                         </label>
                         <select
                           value={item.nfpaFlammability}
-                          onChange={(e) => updateItemField(index, 'nfpaFlammability', parseInt(e.target.value, 10))}
-                          className="w-full px-2.5 py-1.5 bg-slate-900 border border-rose-900/50 rounded-lg text-white font-mono text-xs focus:outline-hidden cursor-pointer"
+                          onChange={(e) => updateItemField(index, 'nfpaFlammability', parseInt(e.target.value) || 0)}
+                          className="w-full px-2 py-1 bg-slate-900 border border-rose-900/60 rounded text-xs font-mono text-white"
                         >
-                          <option value="0">0 - Nicht brennbar</option>
-                          <option value="1">1 - Flammpunkt &gt; 93 °C</option>
-                          <option value="2">2 - Flammpunkt &lt; 93 °C</option>
-                          <option value="3">3 - Flammpunkt &lt; 38 °C</option>
-                          <option value="4">4 - Extrem flüchtig / &lt; 23 °C</option>
+                          {[0, 1, 2, 3, 4].map((v) => (
+                            <option key={v} value={v}>
+                              {v} - {v === 0 ? 'Nicht brennbar' : v === 4 ? 'FP < 23°C' : `Stufe ${v}`}
+                            </option>
+                          ))}
                         </select>
                       </div>
 
-                      {/* Instability (Yellow) */}
-                      <div className="p-3 bg-amber-950/20 border border-amber-900/40 rounded-xl space-y-1.5">
-                        <label className="block text-[11px] font-semibold text-amber-300">
-                          Reaktivität (Gelb 0-4)
+                      {/* Instability - Yellow */}
+                      <div className="p-2.5 rounded-lg bg-amber-950/30 border border-amber-900/40">
+                        <label className="block text-[10px] font-bold text-amber-400 mb-1">
+                          Instabilität (Gelb: 0-4)
                         </label>
                         <select
                           value={item.nfpaInstability}
-                          onChange={(e) => updateItemField(index, 'nfpaInstability', parseInt(e.target.value, 10))}
-                          className="w-full px-2.5 py-1.5 bg-slate-900 border border-amber-900/50 rounded-lg text-white font-mono text-xs focus:outline-hidden cursor-pointer"
+                          onChange={(e) => updateItemField(index, 'nfpaInstability', parseInt(e.target.value) || 0)}
+                          className="w-full px-2 py-1 bg-slate-900 border border-amber-900/60 rounded text-xs font-mono text-white"
                         >
-                          <option value="0">0 - Stabil</option>
-                          <option value="1">1 - Instabil bei Erwärmung</option>
-                          <option value="2">2 - Heftige Reaktion</option>
-                          <option value="3">3 - Explosionsfähig bei Stoß</option>
-                          <option value="4">4 - Kann detonieren</option>
+                          {[0, 1, 2, 3, 4].map((v) => (
+                            <option key={v} value={v}>
+                              {v} - {v === 0 ? 'Stabil' : v === 4 ? 'Explosionsfähig' : `Stufe ${v}`}
+                            </option>
+                          ))}
                         </select>
                       </div>
 
-                      {/* Special Codes (White) */}
-                      <div className="p-3 bg-slate-900/60 border border-slate-800 rounded-xl space-y-1.5">
-                        <label className="block text-[11px] font-semibold text-slate-300">
-                          Sondergefahr (Weiß)
+                      {/* Special Codes - White */}
+                      <div className="p-2.5 rounded-lg bg-slate-800/40 border border-slate-700/60">
+                        <label className="block text-[10px] font-bold text-slate-300 mb-1">
+                          Spezialcode (Weiß)
                         </label>
                         <select
                           value={item.nfpaSpecial}
                           onChange={(e) => updateItemField(index, 'nfpaSpecial', e.target.value)}
-                          className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-white font-mono text-xs focus:outline-hidden cursor-pointer"
+                          className="w-full px-2 py-1 bg-slate-900 border border-slate-700 rounded text-xs font-mono text-white"
                         >
-                          <option value="">Keine Angabe</option>
+                          <option value="">Keiner (None)</option>
                           <option value="OX">OX (Oxidationsmittel)</option>
-                          <option value="W">W̶ (Reagiert mit Wasser)</option>
-                          <option value="SA">SA (Erstickungsgas)</option>
+                          <option value="W">W-Linie (Reagiert mit Wasser)</option>
+                          <option value="SA">SA (Einfaches Erstickungsgas)</option>
+                          <option value="COR">COR (Ätzend)</option>
+                          <option value="BIO">BIO (Biogefährdung)</option>
                         </select>
                       </div>
                     </div>
                   </div>
 
-                  {/* SECTION 9: GHS Pictogram classification tags */}
+                  {/* SECTION 8: GHS Pictogram Classification Tags */}
                   <div className="p-4 bg-slate-900/60 rounded-xl border border-slate-800/80 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <ShieldAlert className="w-4 h-4 text-emerald-400" />
-                        <h5 className="text-xs font-semibold text-white">
-                          GHS Piktogramm-Einstufung
-                        </h5>
-                      </div>
-                      <span className="text-[11px] text-slate-400">
-                        Zutreffende Gefahrensymbole per Klick aktivieren
-                      </span>
+                    <div className="flex items-center gap-2">
+                      <ShieldAlert className="w-4 h-4 text-emerald-400" />
+                      <h5 className="text-xs font-semibold text-white">
+                        8. GHS Piktogramm-Gefahrstoffkennzeichnung
+                      </h5>
                     </div>
 
-                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2.5">
-                      {[
-                        { key: 'toxic', label: 'Giftig (Toxic)', color: 'text-rose-300 border-rose-800/80 bg-rose-950/40' },
-                        { key: 'corrosive', label: 'Ätzend (Corrosive)', color: 'text-amber-300 border-amber-800/80 bg-amber-950/40' },
-                        { key: 'flammable', label: 'Entzündbar (Flammable)', color: 'text-orange-300 border-orange-800/80 bg-orange-950/40' },
-                        { key: 'environment', label: 'Umweltgefährlich', color: 'text-teal-300 border-teal-800/80 bg-teal-950/40' },
-                        { key: 'irritant', label: 'Reizend (Irritant)', color: 'text-yellow-300 border-yellow-800/80 bg-yellow-950/40' },
-                        { key: 'safe', label: 'Unbedenklich (Safe)', color: 'text-emerald-300 border-emerald-800/80 bg-emerald-950/40' },
-                      ].map(({ key, label, color }) => {
-                        const isActive = item.ghsTags[key as keyof typeof item.ghsTags];
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+                      {(
+                        [
+                          { key: 'toxic', label: 'toxic (Giftig)', color: 'text-rose-400 border-rose-900/60' },
+                          { key: 'corrosive', label: 'corrosive (Ätzend)', color: 'text-amber-400 border-amber-900/60' },
+                          { key: 'flammable', label: 'flammable (Entzündbar)', color: 'text-orange-400 border-orange-900/60' },
+                          { key: 'environment', label: 'environment (Umwelt)', color: 'text-emerald-400 border-emerald-900/60' },
+                          { key: 'irritant', label: 'irritant (Reizend)', color: 'text-yellow-400 border-yellow-900/60' },
+                          { key: 'safe', label: 'safe (Keine Kennz.)', color: 'text-blue-400 border-blue-900/60' },
+                        ] as const
+                      ).map(({ key, label, color }) => {
+                        const checked = item.ghsTags[key];
                         return (
-                          <button
+                          <label
                             key={key}
-                            type="button"
-                            onClick={() => {
-                              const updated = {
-                                ...item.ghsTags,
-                                [key]: !isActive,
-                              };
-                              updateItemField(index, 'ghsTags', updated);
-                            }}
-                            className={`p-2.5 rounded-xl border text-xs font-medium flex items-center justify-between gap-1 transition-all cursor-pointer ${
-                              isActive
-                                ? `${color} shadow-xs font-semibold`
-                                : 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700'
+                            className={`p-2.5 rounded-lg border flex items-center gap-2 cursor-pointer transition-colors ${
+                              checked
+                                ? `bg-slate-800 ${color}`
+                                : 'bg-slate-900/50 border-slate-800 text-slate-400 hover:border-slate-700'
                             }`}
                           >
-                            <span>{label}</span>
-                            <span
-                              className={`w-3.5 h-3.5 rounded-full flex items-center justify-center text-[9px] font-bold ${
-                                isActive ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800 text-slate-500'
-                              }`}
-                            >
-                              {isActive ? '✓' : ''}
-                            </span>
-                          </button>
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(e) => {
+                                const newTags = { ...item.ghsTags, [key]: e.target.checked };
+                                if (key !== 'safe' && e.target.checked) {
+                                  newTags.safe = false;
+                                } else if (key === 'safe' && e.target.checked) {
+                                  newTags.toxic = false;
+                                  newTags.corrosive = false;
+                                  newTags.flammable = false;
+                                  newTags.environment = false;
+                                  newTags.irritant = false;
+                                }
+                                updateItemField(index, 'ghsTags', newTags);
+                              }}
+                              className="rounded border-slate-700 text-emerald-500 focus:ring-0 focus:ring-offset-0"
+                            />
+                            <span className="text-[11px] font-medium truncate">{label}</span>
+                          </label>
                         );
                       })}
                     </div>
-                  </div>
-
-                  {/* Card Bottom Actions */}
-                  <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between">
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveSlot(index)}
-                      className="px-3 py-1.5 text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-950/40 rounded-lg border border-rose-900/30 transition-colors inline-flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                      <span>Position entfernen</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={handleAddNewSlot}
-                      className="px-4 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-emerald-400 hover:text-emerald-300 rounded-lg border border-slate-700 transition-colors inline-flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>Nächste Chemikalie anlegen</span>
-                    </button>
                   </div>
                 </div>
               )}
@@ -1122,49 +1657,48 @@ export const BulkAddProductSection: React.FC<BulkAddProductSectionProps> = ({
       </div>
 
       {/* Floating Bottom Publishing Bar */}
-      <div className="sticky bottom-4 z-30 bg-slate-900/95 backdrop-blur-md border border-slate-800 rounded-2xl p-4 shadow-xl flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-slate-800 text-emerald-400 flex items-center justify-center font-mono font-bold text-xs border border-slate-700">
-            {items.length}
-          </div>
-          <div>
-            <div className="text-xs font-semibold text-white">
-              {items.length} {items.length === 1 ? 'Chemikalie' : 'Chemikalien'} erfasst
-            </div>
-            <div className="text-[11px] text-slate-400">
-              Alle Felder & Bindungen aktiv · Direkte Speicherung in Neon PostgreSQL
-            </div>
-          </div>
-        </div>
+      <div className="fixed bottom-0 left-0 right-0 z-40 bg-slate-950/95 backdrop-blur-md border-t border-slate-800 px-6 py-4 shadow-2xl">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={handleAddNewSlot}
+              className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-xs font-semibold inline-flex items-center gap-2 border border-slate-700 hover:border-slate-600 transition-all cursor-pointer"
+            >
+              <Plus className="w-4 h-4 text-emerald-400" />
+              <span>Weitere Chemikalie hinzufügen</span>
+            </button>
 
-        <div className="flex items-center gap-2.5">
-          <button
-            type="button"
-            onClick={handleAddNewSlot}
-            className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl text-xs font-medium inline-flex items-center gap-2 cursor-pointer transition-colors"
-          >
-            <Plus className="w-4 h-4 text-emerald-400" />
-            <span className="hidden sm:inline">Weitere Chemikalie</span>
-          </button>
+            <span className="text-xs text-slate-400 hidden md:inline">
+              <span className="font-bold text-white">{items.length}</span> Position{items.length > 1 ? 'en' : ''} bereit
+            </span>
+          </div>
 
-          <button
-            type="button"
-            disabled={isSubmitting}
-            onClick={handlePublishAll}
-            className="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer shadow-md shadow-emerald-950/40 disabled:opacity-50"
-          >
-            {isSubmitting ? (
-              <>
-                <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                <span>Wird gespeichert...</span>
-              </>
-            ) : (
-              <>
-                <Upload className="w-4 h-4" />
-                <span>Alle {items.length} Produkte veröffentlichen</span>
-              </>
-            )}
-          </button>
+          <div className="flex items-center gap-3 w-full sm:w-auto justify-end">
+            <button
+              type="button"
+              onClick={handlePublishAll}
+              disabled={isSubmitting || hasActiveUploads}
+              className="w-full sm:w-auto px-6 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold inline-flex items-center justify-center gap-2 shadow-lg shadow-emerald-950/60 transition-all cursor-pointer"
+            >
+              {isSubmitting ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>Wird veröffentlicht...</span>
+                </>
+              ) : hasActiveUploads ? (
+                <>
+                  <Cloud className="w-4 h-4 animate-pulse" />
+                  <span>R2 Uploads werden abgeschlossen...</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-4 h-4" />
+                  <span>1-Klick Alle Chemikalien Veröffentlichen ({items.length})</span>
+                </>
+              )}
+            </button>
+          </div>
         </div>
       </div>
     </div>

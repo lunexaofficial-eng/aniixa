@@ -2,8 +2,17 @@ import express, { Request, Response, NextFunction } from 'express';
 import { Pool } from 'pg';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
+import multer from 'multer';
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 
 dotenv.config();
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 250 * 1024 * 1024, // 250 MB max (videos, PDFs, images)
+  },
+});
 
 // ============================================================
 // 1. NEON POSTGRESQL DATABASE & IN-MEMORY STORE
@@ -508,6 +517,23 @@ async function saveStoredIntegrationKey(service: string, credentials: any) {
       console.warn(`Error persisting key ${service} to DB:`, err);
     }
   }
+}
+
+async function getR2Client(): Promise<{ s3: S3Client; config: CloudflareR2Config } | null> {
+  const config = await getStoredIntegrationKey('cloudflare_r2');
+  if (!config || !config.accountId || !config.accessKeyId || !config.secretAccessKey || !config.bucketName) {
+    return null;
+  }
+  const endpoint = config.endpoint || `https://${config.accountId.trim()}.r2.cloudflarestorage.com`;
+  const s3 = new S3Client({
+    region: 'auto',
+    endpoint,
+    credentials: {
+      accessKeyId: config.accessKeyId.trim(),
+      secretAccessKey: config.secretAccessKey.trim(),
+    },
+  });
+  return { s3, config };
 }
 
 // ============================================================
@@ -1181,6 +1207,231 @@ router.post('/admin/keys/r2/test', requireAdmin, async (req, res) => {
   });
 });
 
+// ============================================================
+// CLOUDFLARE R2 PRODUCTION FILE UPLOAD & STREAMING ROUTES
+// ============================================================
+
+// Check Cloudflare R2 connection status
+router.get('/r2/status', async (req, res) => {
+  await initDatabase();
+  const r2 = await getR2Client();
+  if (!r2) {
+    return res.json({
+      configured: false,
+      message: 'Cloudflare R2 ist nicht konfiguriert.',
+    });
+  }
+  return res.json({
+    configured: true,
+    bucket: r2.config.bucketName,
+    publicUrl: r2.config.publicUrl || '',
+    endpoint: r2.config.endpoint,
+    message: 'Cloudflare R2 aktiv und betriebsbereit.',
+  });
+});
+
+// Production Single File Upload to Cloudflare R2
+const handleFileUpload = async (req: Request, res: Response) => {
+  try {
+    await initDatabase();
+    if (!req.file) {
+      return res.status(400).json({ error: 'Keine Datei zum Hochladen übermittelt.' });
+    }
+
+    const r2 = await getR2Client();
+    if (!r2) {
+      return res.status(400).json({
+        error: 'Cloudflare R2 Storage ist nicht konfiguriert. Bitte tragen Sie die Zugangsdaten im Admin-Bereich unter "Schlüssel & APIs" ein.',
+      });
+    }
+
+    const rawFolder = (req.body.folder || 'media').toString();
+    const folder = rawFolder.replace(/[^a-zA-Z0-9_-]/g, '') || 'media';
+    const originalName = req.file.originalname || 'file';
+    const extIndex = originalName.lastIndexOf('.');
+    const ext = extIndex !== -1 ? originalName.substring(extIndex).toLowerCase() : '';
+    const cleanBase = originalName
+      .substring(0, extIndex !== -1 ? extIndex : originalName.length)
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .substring(0, 50);
+    const uniqueId = crypto.randomBytes(4).toString('hex');
+    const objectKey = `uploads/${folder}/${Date.now()}_${uniqueId}_${cleanBase}${ext}`;
+    const contentType = req.file.mimetype || 'application/octet-stream';
+
+    await r2.s3.send(
+      new PutObjectCommand({
+        Bucket: r2.config.bucketName,
+        Key: objectKey,
+        Body: req.file.buffer,
+        ContentType: contentType,
+        CacheControl: 'public, max-age=31536000, immutable',
+      })
+    );
+
+    const publicBase = r2.config.publicUrl ? r2.config.publicUrl.trim().replace(/\/$/, '') : '';
+    const proxyUrl = `/api/storage/${objectKey}`;
+    const url = publicBase ? `${publicBase}/${objectKey}` : proxyUrl;
+
+    return res.json({
+      success: true,
+      url,
+      proxyUrl,
+      cdnUrl: publicBase ? `${publicBase}/${objectKey}` : proxyUrl,
+      key: objectKey,
+      bucket: r2.config.bucketName,
+      fileName: originalName,
+      size: req.file.size,
+      mimeType: contentType,
+      storage: 'cloudflare_r2',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    console.error('R2 Upload Fehler:', err);
+    return res.status(500).json({
+      error: `Cloudflare R2 Upload fehlgeschlagen: ${err.message || 'Interner Serverfehler'}`,
+    });
+  }
+};
+
+router.post('/upload', upload.single('file'), handleFileUpload);
+router.post('/admin/upload', upload.single('file'), handleFileUpload);
+
+// Production Multi-File Upload to Cloudflare R2
+const handleMultiUpload = async (req: Request, res: Response) => {
+  try {
+    await initDatabase();
+    const files = req.files as Express.Multer.File[];
+    if (!files || files.length === 0) {
+      return res.status(400).json({ error: 'Keine Dateien zum Hochladen übermittelt.' });
+    }
+
+    const r2 = await getR2Client();
+    if (!r2) {
+      return res.status(400).json({
+        error: 'Cloudflare R2 Storage ist nicht konfiguriert.',
+      });
+    }
+
+    const rawFolder = (req.body.folder || 'media').toString();
+    const folder = rawFolder.replace(/[^a-zA-Z0-9_-]/g, '') || 'media';
+    const publicBase = r2.config.publicUrl ? r2.config.publicUrl.trim().replace(/\/$/, '') : '';
+
+    const uploadPromises = files.map(async (file) => {
+      const originalName = file.originalname || 'file';
+      const extIndex = originalName.lastIndexOf('.');
+      const ext = extIndex !== -1 ? originalName.substring(extIndex).toLowerCase() : '';
+      const cleanBase = originalName
+        .substring(0, extIndex !== -1 ? extIndex : originalName.length)
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .substring(0, 50);
+      const uniqueId = crypto.randomBytes(4).toString('hex');
+      const objectKey = `uploads/${folder}/${Date.now()}_${uniqueId}_${cleanBase}${ext}`;
+      const contentType = file.mimetype || 'application/octet-stream';
+
+      await r2.s3.send(
+        new PutObjectCommand({
+          Bucket: r2.config.bucketName,
+          Key: objectKey,
+          Body: file.buffer,
+          ContentType: contentType,
+          CacheControl: 'public, max-age=31536000, immutable',
+        })
+      );
+
+      const proxyUrl = `/api/storage/${objectKey}`;
+      const url = publicBase ? `${publicBase}/${objectKey}` : proxyUrl;
+
+      return {
+        success: true,
+        url,
+        proxyUrl,
+        cdnUrl: publicBase ? `${publicBase}/${objectKey}` : proxyUrl,
+        key: objectKey,
+        fileName: originalName,
+        size: file.size,
+        mimeType: contentType,
+      };
+    });
+
+    const results = await Promise.all(uploadPromises);
+
+    return res.json({
+      success: true,
+      bucket: r2.config.bucketName,
+      storage: 'cloudflare_r2',
+      files: results,
+    });
+  } catch (err: any) {
+    console.error('R2 Multi-Upload Fehler:', err);
+    return res.status(500).json({
+      error: `Cloudflare R2 Multi-Upload fehlgeschlagen: ${err.message || 'Interner Serverfehler'}`,
+    });
+  }
+};
+
+router.post('/upload/multiple', upload.array('files', 10), handleMultiUpload);
+router.post('/admin/upload/multiple', upload.array('files', 10), handleMultiUpload);
+
+// Storage Proxy & Video Streaming Handler with Range Support
+router.get('/storage/:key(*)', async (req: Request, res: Response) => {
+  try {
+    const rawKey = req.params.key;
+    if (!rawKey) {
+      return res.status(400).send('Ungültiger Objektschlüssel');
+    }
+
+    const r2 = await getR2Client();
+    if (!r2) {
+      return res.status(503).send('Cloudflare R2 Storage nicht konfiguriert');
+    }
+
+    const rangeHeader = req.headers.range;
+
+    const command = new GetObjectCommand({
+      Bucket: r2.config.bucketName,
+      Key: rawKey,
+      Range: rangeHeader,
+    });
+
+    const response = await r2.s3.send(command);
+
+    if (response.ContentType) {
+      res.setHeader('Content-Type', response.ContentType);
+    }
+    if (response.ETag) {
+      res.setHeader('ETag', response.ETag);
+    }
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    if (response.ContentRange) {
+      res.status(206);
+      res.setHeader('Content-Range', response.ContentRange);
+    }
+    if (response.ContentLength !== undefined) {
+      res.setHeader('Content-Length', response.ContentLength);
+    }
+
+    if (response.Body) {
+      const stream = response.Body as any;
+      if (typeof stream.pipe === 'function') {
+        stream.pipe(res);
+      } else {
+        const bytes = await stream.transformToByteArray();
+        res.end(Buffer.from(bytes));
+      }
+    } else {
+      res.status(204).end();
+    }
+  } catch (err: any) {
+    if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) {
+      return res.status(404).send('Datei nicht in Cloudflare R2 gefunden');
+    }
+    console.warn(`R2 Fetch Error for key ${req.params.key}:`, err.message);
+    return res.status(500).send(`Cloudflare R2 Speicherfehler: ${err.message}`);
+  }
+});
+
 router.post('/admin/keys/resend', requireAdmin, async (req, res) => {
   await initDatabase();
   const { apiKey, fromEmail } = req.body;
@@ -1665,7 +1916,8 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Initialize database in background
 initDatabase().catch((e) => console.warn('DB initialization error:', e));
