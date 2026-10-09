@@ -104,9 +104,43 @@ export default function App() {
     checkDbStatus();
   }, []);
 
+  // Dynamic chemical products state from Neon DB / API
+  const [productsList, setProductsList] = useState<ChemicalProduct[]>(CHEMICAL_PRODUCTS);
+
+  // Fetch catalog products from server
+  const fetchProductsCatalog = async () => {
+    try {
+      const res = await fetch('/api/products');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.products) && data.products.length > 0) {
+          const defaultChemImg = 'https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=600&q=80';
+          const sanitizedDbProducts = data.products.map((p: any) => ({
+            ...p,
+            thumbnail:
+              (p.thumbnail && p.thumbnail.trim()) ||
+              (p.primaryThumbnail && p.primaryThumbnail.trim()) ||
+              (Array.isArray(p.thumbnails) && p.thumbnails.find((t: any) => typeof t === 'string' && t.trim())) ||
+              defaultChemImg,
+          }));
+          // Merge custom database products with standard default catalog
+          const dbIds = new Set(sanitizedDbProducts.map((p: any) => p.id));
+          const nonDuplicatedDefaults = CHEMICAL_PRODUCTS.filter((p) => !dbIds.has(p.id));
+          setProductsList([...sanitizedDbProducts, ...nonDuplicatedDefaults]);
+        }
+      }
+    } catch (e) {
+      console.warn('Could not fetch products catalog from server:', e);
+    }
+  };
+
+  useEffect(() => {
+    fetchProductsCatalog();
+  }, []);
+
   // Filter products by search query, category, and grade
   const filteredProducts = useMemo(() => {
-    return CHEMICAL_PRODUCTS.filter((prod) => {
+    return productsList.filter((prod) => {
       // Category filter
       if (selectedCategory !== 'Alle' && prod.category !== selectedCategory) {
         return false;
@@ -120,17 +154,17 @@ export default function App() {
       // Search query (matches name, CAS number, formula, or IUPAC name)
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase().trim();
-        const matchesName = prod.name.toLowerCase().includes(q);
-        const matchesCas = prod.casNumber.toLowerCase().includes(q);
-        const matchesFormula = prod.formula.toLowerCase().includes(q);
-        const matchesIupac = prod.iupacName.toLowerCase().includes(q);
-        const matchesId = prod.id.toLowerCase().includes(q);
+        const matchesName = prod.name?.toLowerCase().includes(q);
+        const matchesCas = prod.casNumber?.toLowerCase().includes(q);
+        const matchesFormula = prod.formula?.toLowerCase().includes(q);
+        const matchesIupac = prod.iupacName?.toLowerCase().includes(q);
+        const matchesId = prod.id?.toLowerCase().includes(q);
         return matchesName || matchesCas || matchesFormula || matchesIupac || matchesId;
       }
 
       return true;
     });
-  }, [searchQuery, selectedCategory, selectedGrade]);
+  }, [productsList, searchQuery, selectedCategory, selectedGrade]);
 
   const grades = ['Alle', 'p.a. (pro analysi)', 'Ph. Eur. / DAB', 'ACS Reagent'];
 

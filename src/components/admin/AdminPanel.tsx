@@ -21,7 +21,9 @@ import {
   Mail,
   Sliders,
   Clock,
-  Sparkles
+  Sparkles,
+  PlusCircle,
+  Layers
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { CHEMICAL_PRODUCTS } from '../../data/products';
@@ -31,6 +33,8 @@ import {
   registerFingerprintPasskey
 } from '../../utils/webauthn';
 import { KeysManagement } from './KeysManagement';
+import { BulkAddProductSection } from './BulkAddProductSection';
+import { ChemicalProduct } from '../../types/chemical';
 
 interface AdminPanelProps {
   token: string;
@@ -39,7 +43,7 @@ interface AdminPanelProps {
   onReturnToMarket: () => void;
 }
 
-type AdminTab = 'dashboard' | 'enquiries' | 'products' | 'keys' | 'profile' | 'security';
+type AdminTab = 'dashboard' | 'enquiries' | 'add-products' | 'products' | 'keys' | 'profile' | 'security';
 
 export const AdminPanel: React.FC<AdminPanelProps> = ({
   token,
@@ -51,6 +55,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [adminUser, setAdminUser] = useState<any>(initialUser || {});
   const [enquiries, setEnquiries] = useState<any[]>([]);
   const [passkeys, setPasskeys] = useState<any[]>([]);
+  const [customProducts, setCustomProducts] = useState<ChemicalProduct[]>([]);
   const [stats, setStats] = useState<any>({ totalEnquiries: 0, registeredPasskeys: 0, databaseConnected: false });
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -179,6 +184,15 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         setProfileName(d.user.fullName);
         setProfilePhone(d.user.phone || '');
       }
+
+      // 5. Products Catalog from API/Database
+      const prodRes = await fetch('/api/products');
+      if (prodRes.ok) {
+        const d = await prodRes.json();
+        if (Array.isArray(d.products)) {
+          setCustomProducts(d.products);
+        }
+      }
     } catch (err: any) {
       console.warn('Admin fetch error:', err);
     } finally {
@@ -301,7 +315,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const navTabs: { id: AdminTab; label: string; icon: React.ReactNode; count?: number }[] = [
     { id: 'dashboard', label: 'Dashboard', icon: <Activity className="w-3.5 h-3.5" /> },
     { id: 'enquiries', label: 'Anfragen', icon: <MessageSquare className="w-3.5 h-3.5" />, count: enquiries.length },
-    { id: 'products', label: 'Reagenzien & Bestand', icon: <Package className="w-3.5 h-3.5" />, count: CHEMICAL_PRODUCTS.length },
+    { id: 'add-products', label: 'Produkte hinzufügen (Bulk)', icon: <PlusCircle className="w-3.5 h-3.5 text-emerald-400" /> },
+    { id: 'products', label: 'Reagenzien & Bestand', icon: <Package className="w-3.5 h-3.5" />, count: (customProducts.length > 0 ? customProducts.length : CHEMICAL_PRODUCTS.length) },
     { id: 'keys', label: 'Keys & Storage', icon: <Key className="w-3.5 h-3.5" /> },
     { id: 'profile', label: 'Admin-Profil', icon: <User className="w-3.5 h-3.5" /> },
     { id: 'security', label: 'Sicherheit & Passkeys', icon: <Fingerprint className="w-3.5 h-3.5" />, count: passkeys.length },
@@ -737,43 +752,122 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         )}
 
         {/* ------------------------------------------------------------- */}
-        {/* TAB 3: PRODUCTS INVENTORY */}
+        {/* TAB 3: BULK ADD PRODUCTS */}
+        {/* ------------------------------------------------------------- */}
+        {activeTab === 'add-products' && (
+          <BulkAddProductSection
+            token={token}
+            onPublishedSuccess={(newProducts) => {
+              setCustomProducts((prev) => [...newProducts, ...prev]);
+              showNotice('success', `${newProducts.length} Chemikalien erfolgreich gespeichert!`);
+              // Refresh full catalog from backend
+              fetchData();
+            }}
+          />
+        )}
+
+        {/* ------------------------------------------------------------- */}
+        {/* TAB 4: PRODUCTS INVENTORY */}
         {/* ------------------------------------------------------------- */}
         {activeTab === 'products' && (
           <div className="space-y-4 animate-in fade-in duration-200">
-            <div>
-              <h2 className="text-lg font-bold text-white">Reagenzien & Katalogbestand</h2>
-              <p className="text-xs text-slate-400">
-                Übersicht aller gelisteten Chemikalien nach deutschen Qualitätsnormen.
-              </p>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-bold text-white">Reagenzien & Katalogbestand</h2>
+                <p className="text-xs text-slate-400">
+                  Übersicht aller gelisteten Chemikalien nach deutschen & internationalen Qualitätsnormen.
+                </p>
+              </div>
+
+              <button
+                onClick={() => setActiveTab('add-products')}
+                className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold inline-flex items-center gap-2 cursor-pointer shadow-md transition-all self-start sm:self-auto"
+              >
+                <PlusCircle className="w-4 h-4" />
+                <span>+ Neue Chemikalien (Bulk) hinzufügen</span>
+              </button>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {CHEMICAL_PRODUCTS.map((prod) => (
-                <div
-                  key={prod.id}
-                  className="p-4 bg-slate-950/80 border border-slate-800 rounded-xl space-y-3 text-xs"
-                >
-                  <div className="flex items-start gap-3">
-                    <img
-                      src={prod.thumbnail}
-                      alt={prod.name}
-                      className="w-14 h-14 object-cover rounded-lg bg-slate-900 border border-slate-800 shrink-0"
-                    />
-                    <div className="min-w-0">
-                      <div className="font-mono text-[10px] text-emerald-400">{prod.id} · CAS {prod.casNumber}</div>
-                      <div className="font-bold text-white truncate">{prod.name}</div>
-                      <div className="text-slate-400">{prod.purity} · {prod.grade}</div>
+            {/* List all products (combining custom uploaded and catalog defaults) */}
+            {(() => {
+              const displayList = customProducts.length > 0 ? customProducts : CHEMICAL_PRODUCTS;
+              return (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {displayList.map((prod) => (
+                    <div
+                      key={prod.id}
+                      className="p-4 bg-slate-950/80 border border-slate-800 rounded-xl space-y-3 text-xs relative group hover:border-slate-700 transition-colors"
+                    >
+                      <div className="flex items-start gap-3">
+                        {(() => {
+                          const fallbackImg = 'https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=400&q=80';
+                          const safeThumb =
+                            (prod.thumbnail && prod.thumbnail.trim()) ||
+                            (prod.primaryThumbnail && prod.primaryThumbnail.trim()) ||
+                            (prod.thumbnails && prod.thumbnails.find((t) => t && t.trim())) ||
+                            fallbackImg;
+                          return (
+                            <img
+                              src={safeThumb}
+                              alt={prod.name}
+                              className="w-14 h-14 object-cover rounded-lg bg-slate-900 border border-slate-800 shrink-0"
+                              referrerPolicy="no-referrer"
+                              onError={(e) => {
+                                if (e.currentTarget.src !== fallbackImg) {
+                                  e.currentTarget.src = fallbackImg;
+                                }
+                              }}
+                            />
+                          );
+                        })()}
+                        <div className="min-w-0 flex-1">
+                          <div className="font-mono text-[10px] text-emerald-400 flex items-center gap-1.5">
+                            <span>{prod.id}</span>
+                            <span>·</span>
+                            <span>CAS {prod.casNumber}</span>
+                          </div>
+                          <div className="font-bold text-white truncate text-sm" title={prod.name}>
+                            {prod.name}
+                          </div>
+                          <div className="text-slate-400 text-[11px] truncate">
+                            {prod.purity} · {prod.grade}
+                          </div>
+                          {prod.formula && (
+                            <div className="font-mono text-[11px] text-emerald-400/90 font-medium">
+                              {prod.formula}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Badges / NFPA / GHS mini indicator */}
+                      {(prod.nfpaDiamond || (prod.ghsPictograms && prod.ghsPictograms.length > 0)) && (
+                        <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[10px] font-mono">
+                          {prod.nfpaDiamond && (
+                            <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-300">
+                              NFPA: H{prod.nfpaDiamond.health}/F{prod.nfpaDiamond.flammability}/R{prod.nfpaDiamond.instability}
+                            </span>
+                          )}
+                          {prod.ghsPictograms?.map((tag) => (
+                            <span
+                              key={tag}
+                              className="px-1.5 py-0.5 rounded bg-amber-950/50 border border-amber-800/60 text-amber-300 uppercase text-[9px]"
+                            >
+                              {tag}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                      <div className="flex items-center justify-between pt-2 border-t border-slate-800 font-mono">
+                        <div className="text-emerald-400 font-bold text-sm">{prod.price}</div>
+                        <div className="text-slate-400">{prod.unit}</div>
+                      </div>
                     </div>
-                  </div>
-
-                  <div className="flex items-center justify-between pt-2 border-t border-slate-800 font-mono">
-                    <div className="text-emerald-400 font-bold text-sm">{prod.price}</div>
-                    <div className="text-slate-400">{prod.unit}</div>
-                  </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+              );
+            })()}
           </div>
         )}
 

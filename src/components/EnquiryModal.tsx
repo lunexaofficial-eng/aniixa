@@ -202,12 +202,27 @@ export const EnquiryModal: React.FC<EnquiryModalProps> = ({
           <div className="flex items-start gap-4">
             {/* Fetched Product Thumbnail */}
             <div className="relative w-20 h-20 sm:w-24 sm:h-24 rounded-lg bg-slate-100 border border-slate-200 overflow-hidden shrink-0 shadow-2xs">
-              <img
-                src={product.thumbnail}
-                alt={product.name}
-                className="w-full h-full object-cover"
-                referrerPolicy="no-referrer"
-              />
+              {(() => {
+                const fallbackImg = 'https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=400&q=80';
+                const safeSrc =
+                  (product.thumbnail && product.thumbnail.trim()) ||
+                  (product.primaryThumbnail && product.primaryThumbnail.trim()) ||
+                  (product.thumbnails && product.thumbnails.find((t) => t && t.trim())) ||
+                  fallbackImg;
+                return (
+                  <img
+                    src={safeSrc}
+                    alt={product.name}
+                    className="w-full h-full object-cover"
+                    referrerPolicy="no-referrer"
+                    onError={(e) => {
+                      if (e.currentTarget.src !== fallbackImg) {
+                        e.currentTarget.src = fallbackImg;
+                      }
+                    }}
+                  />
+                );
+              })()}
             </div>
 
             {/* Fetched Product Details */}

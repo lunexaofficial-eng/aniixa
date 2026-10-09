@@ -253,6 +253,46 @@ export async function initDatabase(forceRetry = false): Promise<void> {
           );
         `);
 
+        // 6. chemical_products table for persistent product uploads & catalog
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS chemical_products (
+            id VARCHAR(100) PRIMARY KEY,
+            cas_number VARCHAR(100) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            iupac_name VARCHAR(255),
+            formula VARCHAR(100),
+            molar_mass VARCHAR(100),
+            grade VARCHAR(100),
+            purity VARCHAR(100),
+            price VARCHAR(100),
+            unit VARCHAR(100),
+            price_per_unit VARCHAR(100),
+            thumbnail TEXT,
+            thumbnails TEXT[],
+            primary_thumbnail TEXT,
+            category VARCHAR(100),
+            in_stock BOOLEAN DEFAULT TRUE,
+            stock_units INTEGER DEFAULT 10,
+            physical_state VARCHAR(100),
+            packaging VARCHAR(255),
+            un_number VARCHAR(100),
+            hazard_summary TEXT,
+            description TEXT,
+            applications TEXT[],
+            sds_document_url TEXT,
+            sds_document_name VARCHAR(255),
+            demo_video_url TEXT,
+            melting_point VARCHAR(100),
+            boiling_point VARCHAR(100),
+            nfpa_health INTEGER DEFAULT 0,
+            nfpa_flammability INTEGER DEFAULT 0,
+            nfpa_instability INTEGER DEFAULT 0,
+            nfpa_special VARCHAR(50) DEFAULT '',
+            ghs_pictograms TEXT[],
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+          );
+        `);
+
         // 6. Seed default admin account
         const checkUser = await pool.query('SELECT * FROM admin_users WHERE email = $1', ['lunexa.official@gmail.com']);
         if (checkUser.rows.length === 0) {
@@ -1044,6 +1084,7 @@ router.get('/admin/stats', requireAdmin, async (req, res) => {
   await initDatabase();
   let enquiryCount = memoryEnquiries.length;
   let passkeyCount = memoryPasskeys.length;
+  let productCount = fallbackProducts.length;
 
   if (isDbConnected || process.env.DATABASE_URL) {
     try {
@@ -1052,6 +1093,9 @@ router.get('/admin/stats', requireAdmin, async (req, res) => {
 
       const pkRes = await queryWithRetry('SELECT COUNT(*) as count FROM admin_passkeys');
       if (pkRes) passkeyCount = Number(pkRes.rows[0]?.count || 0);
+
+      const prodRes = await queryWithRetry('SELECT COUNT(*) as count FROM chemical_products');
+      if (prodRes) productCount = Number(prodRes.rows[0]?.count || 0);
     } catch (e) {
       console.warn('Error fetching stats:', e);
     }
@@ -1060,6 +1104,7 @@ router.get('/admin/stats', requireAdmin, async (req, res) => {
   res.json({
     totalEnquiries: enquiryCount,
     registeredPasskeys: passkeyCount,
+    totalProducts: productCount,
     databaseConnected: isDbConnected,
     adminEmail: 'lunexa.official@gmail.com',
   });
@@ -1337,6 +1382,271 @@ router.delete('/admin/keys/:service', requireAdmin, async (req, res) => {
   const { service } = req.params;
   await saveStoredIntegrationKey(service, null);
   res.json({ success: true, message: `Schlüssel für ${service} wurden zurückgesetzt.` });
+});
+
+// ============================================================
+// 3. CHEMICAL PRODUCTS & BULK UPLOAD ENDPOINTS
+// ============================================================
+
+// In-memory fallback if DB is not yet connected
+let fallbackProducts: any[] = [];
+
+router.get('/products', async (req, res) => {
+  await initDatabase();
+  if (isDbConnected || process.env.DATABASE_URL) {
+    try {
+      const result = await queryWithRetry('SELECT * FROM chemical_products ORDER BY created_at DESC');
+      if (result && result.rows.length > 0) {
+        const defaultChemImg = 'https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=600&q=80';
+        const formatted = result.rows.map((row: any) => {
+          const rawThumbs = Array.isArray(row.thumbnails) ? row.thumbnails : [];
+          const validRowThumbs = rawThumbs.filter((t: any) => typeof t === 'string' && t.trim().length > 0);
+          const safeThumbnail =
+            (row.thumbnail && row.thumbnail.trim()) ||
+            (row.primary_thumbnail && row.primary_thumbnail.trim()) ||
+            (validRowThumbs.length > 0 ? validRowThumbs[0] : '') ||
+            defaultChemImg;
+
+          return {
+            id: row.id,
+            casNumber: row.cas_number,
+            name: row.name,
+            iupacName: row.iupac_name,
+            formula: row.formula,
+            molarMass: row.molar_mass,
+            grade: row.grade,
+            purity: row.purity,
+            price: row.price,
+            unit: row.unit,
+            pricePerLiterOrKg: row.price_per_unit || row.price,
+            thumbnail: safeThumbnail,
+            thumbnails: validRowThumbs.length > 0 ? validRowThumbs : [safeThumbnail],
+            primaryThumbnail: safeThumbnail,
+          category: row.category,
+          inStock: row.in_stock,
+          stockUnits: row.stock_units,
+          physicalState: row.physical_state,
+          leadTime: '1–2 Werktage',
+          packaging: row.packaging,
+          unNumber: row.un_number,
+          hazardSummary: row.hazard_summary,
+          description: row.description,
+          applications: row.applications || [],
+          sdsDocumentUrl: row.sds_document_url,
+          sdsDocumentName: row.sds_document_name,
+          demoVideoUrl: row.demo_video_url,
+          meltingPoint: row.melting_point,
+          boilingPoint: row.boiling_point,
+          nfpaDiamond: {
+            health: row.nfpa_health || 0,
+            flammability: row.nfpa_flammability || 0,
+            instability: row.nfpa_instability || 0,
+            special: row.nfpa_special || '',
+          },
+          ghsPictograms: row.ghs_pictograms || [],
+          createdAt: row.created_at,
+        };
+      });
+        return res.json({ products: formatted, source: 'database' });
+      }
+    } catch (err: any) {
+      console.warn('⚠️ Fetching products from DB failed:', err.message);
+    }
+  }
+
+  return res.json({ products: fallbackProducts, source: 'fallback' });
+});
+
+router.post('/admin/products/bulk', requireAdmin, async (req, res) => {
+  await initDatabase();
+  const { products } = req.body;
+
+  if (!Array.isArray(products) || products.length === 0) {
+    return res.status(400).json({ error: 'Keine Produkte für den Bulk-Upload angegeben.' });
+  }
+
+  const savedProducts: any[] = [];
+  const errors: string[] = [];
+
+  for (let i = 0; i < products.length; i++) {
+    const p = products[i];
+    if (!p.name || !p.name.trim()) {
+      errors.push(`Produkt #${i + 1}: Name ist erforderlich.`);
+      continue;
+    }
+
+    // Generate canonical product ID if not provided
+    const productId = p.id?.trim() || `DE-CHEM-${Math.floor(1000 + Math.random() * 9000)}`;
+    const casNumber = p.casNumber?.trim() || 'N/A';
+    const name = p.name.trim();
+    const iupacName = p.iupacName?.trim() || name;
+    const formula = p.formula?.trim() || '';
+    const molarMass = p.molarMass?.trim() || '';
+    const grade = p.grade || 'p.a. (pro analysi)';
+    const purity = p.purity?.trim() || '≥ 99.0%';
+    const price = p.price?.trim() ? (p.price.includes('$') || p.price.includes('€') ? p.price.trim() : `$ ${p.price.trim()}`) : '$ 0.00';
+    const unit = p.unit?.trim() || '1.000 ml';
+    const pricePerUnit = p.pricePerLiterOrKg?.trim() || `${price} / Einheit`;
+    const defaultChemImg = 'https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=600&q=80';
+    const rawThumbs = Array.isArray(p.thumbnails) ? p.thumbnails : (p.thumbnail ? [p.thumbnail] : []);
+    const validThumbs = rawThumbs.filter((t: any) => typeof t === 'string' && t.trim().length > 0);
+    const primaryThumbnail = (p.primaryThumbnail && p.primaryThumbnail.trim()) || (validThumbs.length > 0 ? validThumbs[0] : defaultChemImg);
+    const thumbnail = (p.thumbnail && p.thumbnail.trim()) || primaryThumbnail || defaultChemImg;
+    const thumbnails = validThumbs.length > 0 ? validThumbs : [thumbnail];
+    const category = p.category || 'Solvents';
+    const inStock = p.inStock !== false;
+    const stockUnits = typeof p.stockUnits === 'number' ? p.stockUnits : parseInt(p.stockUnits || '10', 10) || 10;
+    const physicalState = p.physicalState || 'Flüssig (Liquid)';
+    const packaging = p.packaging?.trim() || 'Labor-Sicherheitsgebinde';
+    const unNumber = p.unNumber?.trim() || '';
+    const hazardSummary = p.hazardSummary?.trim() || (p.ghsPictograms?.length ? p.ghsPictograms.join(', ') : 'Keine Gefahreneinstufung');
+    const description = p.description?.trim() || `${name} (${casNumber}) in technischer Analysenqualität.`;
+    const applications = Array.isArray(p.applications) ? p.applications : ['Analytik & Synthese'];
+    const sdsDocumentUrl = p.sdsDocumentUrl?.trim() || '';
+    const sdsDocumentName = p.sdsDocumentName?.trim() || '';
+    const demoVideoUrl = p.demoVideoUrl?.trim() || '';
+    const meltingPoint = p.meltingPoint?.trim() || '';
+    const boilingPoint = p.boilingPoint?.trim() || '';
+    const nfpaHealth = p.nfpaDiamond?.health ?? 0;
+    const nfpaFlammability = p.nfpaDiamond?.flammability ?? 0;
+    const nfpaInstability = p.nfpaDiamond?.instability ?? 0;
+    const nfpaSpecial = p.nfpaDiamond?.special || '';
+    const ghsPictograms = Array.isArray(p.ghsPictograms) ? p.ghsPictograms : [];
+
+    const productRecord = {
+      id: productId,
+      casNumber,
+      name,
+      iupacName,
+      formula,
+      molarMass,
+      grade,
+      purity,
+      price,
+      unit,
+      pricePerLiterOrKg: pricePerUnit,
+      thumbnail,
+      thumbnails,
+      primaryThumbnail,
+      category,
+      inStock,
+      stockUnits,
+      physicalState,
+      packaging,
+      unNumber,
+      hazardSummary,
+      description,
+      applications,
+      sdsDocumentUrl,
+      sdsDocumentName,
+      demoVideoUrl,
+      meltingPoint,
+      boilingPoint,
+      nfpaDiamond: {
+        health: nfpaHealth,
+        flammability: nfpaFlammability,
+        instability: nfpaInstability,
+        special: nfpaSpecial,
+      },
+      ghsPictograms,
+      createdAt: new Date().toISOString(),
+    };
+
+    if (isDbConnected || process.env.DATABASE_URL) {
+      try {
+        await queryWithRetry(`
+          INSERT INTO chemical_products (
+            id, cas_number, name, iupac_name, formula, molar_mass, grade, purity,
+            price, unit, price_per_unit, thumbnail, thumbnails, primary_thumbnail,
+            category, in_stock, stock_units, physical_state, packaging, un_number,
+            hazard_summary, description, applications, sds_document_url, sds_document_name,
+            demo_video_url, melting_point, boiling_point, nfpa_health, nfpa_flammability,
+            nfpa_instability, nfpa_special, ghs_pictograms
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8,
+            $9, $10, $11, $12, $13, $14,
+            $15, $16, $17, $18, $19, $20,
+            $21, $22, $23, $24, $25,
+            $26, $27, $28, $29, $30,
+            $31, $32, $33
+          )
+          ON CONFLICT (id) DO UPDATE SET
+            cas_number = EXCLUDED.cas_number,
+            name = EXCLUDED.name,
+            iupac_name = EXCLUDED.iupac_name,
+            formula = EXCLUDED.formula,
+            molar_mass = EXCLUDED.molar_mass,
+            grade = EXCLUDED.grade,
+            purity = EXCLUDED.purity,
+            price = EXCLUDED.price,
+            unit = EXCLUDED.unit,
+            price_per_unit = EXCLUDED.price_per_unit,
+            thumbnail = EXCLUDED.thumbnail,
+            thumbnails = EXCLUDED.thumbnails,
+            primary_thumbnail = EXCLUDED.primary_thumbnail,
+            category = EXCLUDED.category,
+            in_stock = EXCLUDED.in_stock,
+            stock_units = EXCLUDED.stock_units,
+            physical_state = EXCLUDED.physical_state,
+            packaging = EXCLUDED.packaging,
+            un_number = EXCLUDED.un_number,
+            hazard_summary = EXCLUDED.hazard_summary,
+            description = EXCLUDED.description,
+            applications = EXCLUDED.applications,
+            sds_document_url = EXCLUDED.sds_document_url,
+            sds_document_name = EXCLUDED.sds_document_name,
+            demo_video_url = EXCLUDED.demo_video_url,
+            melting_point = EXCLUDED.melting_point,
+            boiling_point = EXCLUDED.boiling_point,
+            nfpa_health = EXCLUDED.nfpa_health,
+            nfpa_flammability = EXCLUDED.nfpa_flammability,
+            nfpa_instability = EXCLUDED.nfpa_instability,
+            nfpa_special = EXCLUDED.nfpa_special,
+            ghs_pictograms = EXCLUDED.ghs_pictograms
+        `, [
+          productId, casNumber, name, iupacName, formula, molarMass, grade, purity,
+          price, unit, pricePerUnit, thumbnail, thumbnails, primaryThumbnail,
+          category, inStock, stockUnits, physicalState, packaging, unNumber,
+          hazardSummary, description, applications, sdsDocumentUrl, sdsDocumentName,
+          demoVideoUrl, meltingPoint, boilingPoint, nfpaHealth, nfpaFlammability,
+          nfpaInstability, nfpaSpecial, ghsPictograms
+        ]);
+        savedProducts.push(productRecord);
+      } catch (dbErr: any) {
+        console.warn(`Error inserting product ${productId} into DB:`, dbErr.message);
+        errors.push(`Produkt ${name}: DB-Fehler (${dbErr.message})`);
+        fallbackProducts.unshift(productRecord);
+        savedProducts.push(productRecord);
+      }
+    } else {
+      fallbackProducts.unshift(productRecord);
+      savedProducts.push(productRecord);
+    }
+  }
+
+  return res.json({
+    success: true,
+    publishedCount: savedProducts.length,
+    savedProducts,
+    errors: errors.length > 0 ? errors : undefined,
+    message: `${savedProducts.length} Chemikalien erfolgreich ${isDbConnected ? 'in Neon PostgreSQL' : 'im Katalog'} veröffentlicht!`,
+  });
+});
+
+router.delete('/admin/products/:id', requireAdmin, async (req, res) => {
+  await initDatabase();
+  const { id } = req.params;
+
+  if (isDbConnected || process.env.DATABASE_URL) {
+    try {
+      await queryWithRetry('DELETE FROM chemical_products WHERE id = $1', [id]);
+    } catch (err: any) {
+      console.warn('DB delete error:', err.message);
+    }
+  }
+
+  fallbackProducts = fallbackProducts.filter((p) => p.id !== id);
+  return res.json({ success: true, message: `Produkt ${id} erfolgreich entfernt.` });
 });
 
 // ============================================================

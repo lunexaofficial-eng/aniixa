@@ -13,19 +13,27 @@ export const ProductCard: React.FC<ProductCardProps> = ({
   onEnquire,
   onViewDetails,
 }) => {
+  const fallbackImg = 'https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=600&q=80';
+  const cardImage =
+    (product.thumbnail && product.thumbnail.trim()) ||
+    (product.primaryThumbnail && product.primaryThumbnail.trim()) ||
+    (product.thumbnails && product.thumbnails.find((t) => t && t.trim())) ||
+    fallbackImg;
+
   return (
     <article className="group bg-white rounded-xl border border-slate-200 overflow-hidden hover:border-slate-300 hover:shadow-md transition-all duration-200 flex flex-col justify-between">
       {/* Top: Image & Essential Tags */}
       <div>
         <div className="relative aspect-4/3 bg-slate-100 overflow-hidden border-b border-slate-100">
           <img
-            src={product.thumbnail}
+            src={cardImage}
             alt={product.name}
             className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-300"
             referrerPolicy="no-referrer"
             onError={(e) => {
-              // Fallback to solid technical card if image cannot render
-              e.currentTarget.style.display = 'none';
+              if (e.currentTarget.src !== fallbackImg) {
+                e.currentTarget.src = fallbackImg;
+              }
             }}
           />
           {/* Subtle overlay indicators */}

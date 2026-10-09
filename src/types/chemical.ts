@@ -19,6 +19,24 @@ export interface ChemicalProduct {
   hazardSummary: string; // e.g. "GHS02 Flamme"
   description: string;
   applications: string[];
+  // Extended properties for bulk uploads & comprehensive specs
+  physicalState?: 'Flüssig (Liquid)' | 'Feststoff / Pulver (Solid/Powder)' | 'Kristallin (Crystalline)' | 'Gasförmig (Gas)';
+  stockUnits?: number;
+  thumbnails?: string[];
+  primaryThumbnail?: string;
+  sdsDocumentUrl?: string;
+  sdsDocumentName?: string;
+  demoVideoUrl?: string;
+  meltingPoint?: string; // e.g. "-114 °C"
+  boilingPoint?: string; // e.g. "78.37 °C"
+  nfpaDiamond?: {
+    health: number; // 0-4
+    flammability: number; // 0-4
+    instability: number; // 0-4
+    special: string; // 'OX', 'W', 'SA', ''
+  };
+  ghsPictograms?: ('toxic' | 'corrosive' | 'flammable' | 'environment' | 'irritant' | 'safe')[];
+  createdAt?: string;
 }
 
 export interface EnquirySubmission {
